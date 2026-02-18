@@ -246,10 +246,11 @@ class ArchonStore:
         )
         return cursor.rowcount
 
-    def list_bindings(self) -> List[Dict[str, Any]]:
+    def list_bindings(self, limit: int = 1000) -> List[Dict[str, Any]]:
         conn = self._get_connection()
         rows = conn.execute(
-            "SELECT * FROM archon_bindings ORDER BY updated_at DESC"
+            "SELECT * FROM archon_bindings ORDER BY updated_at DESC LIMIT ?",
+            (limit,),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -386,21 +387,26 @@ class ArchonStore:
         Returns the number of polls deleted.
         """
         conn = self._get_connection()
-        # Delete votes first (foreign key constraint)
-        conn.execute(
-            """
-            DELETE FROM archon_votes WHERE poll_id IN (
-                SELECT poll_id FROM archon_polls
-                WHERE status = 'completed' AND deadline < ?
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """
+                DELETE FROM archon_votes WHERE poll_id IN (
+                    SELECT poll_id FROM archon_polls
+                    WHERE status = 'completed' AND deadline < ?
+                )
+                """,
+                (before_ts,),
             )
-            """,
-            (before_ts,),
-        )
-        cursor = conn.execute(
-            "DELETE FROM archon_polls WHERE status = 'completed' AND deadline < ?",
-            (before_ts,),
-        )
-        return cursor.rowcount
+            cursor = conn.execute(
+                "DELETE FROM archon_polls WHERE status = 'completed' AND deadline < ?",
+                (before_ts,),
+            )
+            conn.execute("COMMIT")
+            return cursor.rowcount
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 class ArchonGatewayClient:
@@ -566,7 +572,8 @@ class ArchonService:
 
     def _resolve_did(self, did: str = "") -> str:
         if did:
-            return did.strip()
+            resolved = did.strip()
+            return resolved if _is_valid_did(resolved) else ""
         identity = self.store.get_identity()
         return str(identity.get("did", "")) if identity else ""
 
@@ -826,8 +833,9 @@ class ArchonService:
         return cleaned
 
     def _refresh_poll_state(self, poll: Dict[str, Any]) -> Dict[str, Any]:
-        if poll.get("status") == "active" and int(poll.get("deadline") or 0) <= self._now():
-            self.store.set_poll_status(str(poll["poll_id"]), "completed", self._now())
+        now_ts = self._now()
+        if poll.get("status") == "active" and int(poll.get("deadline") or 0) <= now_ts:
+            self.store.set_poll_status(str(poll["poll_id"]), "completed", now_ts)
             updated = self.store.get_poll(str(poll["poll_id"]))
             return updated or poll
         return poll
@@ -941,8 +949,8 @@ class ArchonService:
         tally: Dict[str, int] = {opt: 0 for opt in options if isinstance(opt, str)}
         for vote in votes:
             choice = vote.get("choice")
-            if isinstance(choice, str):
-                tally[choice] = tally.get(choice, 0) + 1
+            if isinstance(choice, str) and choice in tally:
+                tally[choice] += 1
 
         return {
             "ok": True,
@@ -984,6 +992,8 @@ class ArchonService:
         choice = choice.strip()
         if not choice:
             return {"error": "choice is required"}
+        if len(choice) > 64:
+            return {"error": "choice too long (max 64 chars)"}
 
         if not isinstance(reason, str):
             return {"error": "reason must be a string"}
