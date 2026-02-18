@@ -6,11 +6,13 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 
 def _is_hex(value: str, expected_len: int) -> bool:
@@ -35,26 +37,48 @@ def _is_valid_cln_pubkey(value: str) -> bool:
     return _is_hex(value, 66)
 
 
+def _is_valid_did(value: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    did = value.strip()
+    if len(did) < 12 or len(did) > 128:
+        return False
+    if not did.startswith("did:cid:"):
+        return False
+    suffix = did[8:]
+    if not suffix:
+        return False
+    return all(ch.isalnum() or ch in "-._:" for ch in suffix)
+
+
 class ArchonStore:
     """SQLite persistence for archon identity, bindings, polls, and votes."""
 
     def __init__(self, db_path: str, logger: Optional[Callable[[str, str], None]] = None):
         self.db_path = os.path.expanduser(db_path)
         self._logger = logger
-        self._conn: Optional[sqlite3.Connection] = None
+        self._local = threading.local()
 
     def _log(self, message: str, level: str = "info") -> None:
         if self._logger:
             self._logger(message, level)
 
     def _get_connection(self) -> sqlite3.Connection:
-        if self._conn is None:
-            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-            self._conn = sqlite3.connect(self.db_path)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL;")
-            self._conn.execute("PRAGMA foreign_keys=ON;")
-        return self._conn
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            db_dir = os.path.dirname(self.db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+            conn = sqlite3.connect(
+                self.db_path,
+                isolation_level=None,
+                timeout=30.0,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            self._local.conn = conn
+        return conn
 
     def initialize(self) -> None:
         conn = self._get_connection()
@@ -141,7 +165,7 @@ class ArchonStore:
             """
         )
 
-        conn.commit()
+        conn.execute("PRAGMA optimize;")
 
     def get_identity(self) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
@@ -171,7 +195,6 @@ class ArchonStore:
             """,
             (did, governance_tier, status, source, gateway_url, created_at, now_ts),
         )
-        conn.commit()
 
     def update_governance_tier(self, governance_tier: str, now_ts: int) -> None:
         conn = self._get_connection()
@@ -179,7 +202,6 @@ class ArchonStore:
             "UPDATE archon_identity SET governance_tier = ?, updated_at = ? WHERE singleton_id = 1",
             (governance_tier, now_ts),
         )
-        conn.commit()
 
     def upsert_binding(
         self,
@@ -216,7 +238,6 @@ class ArchonStore:
                 now_ts,
             ),
         )
-        conn.commit()
 
     def list_bindings(self) -> List[Dict[str, Any]]:
         conn = self._get_connection()
@@ -258,7 +279,6 @@ class ArchonStore:
                 now_ts,
             ),
         )
-        conn.commit()
 
     def get_poll(self, poll_id: str) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
@@ -274,7 +294,6 @@ class ArchonStore:
             "UPDATE archon_polls SET status = ?, updated_at = ? WHERE poll_id = ?",
             (status, now_ts, poll_id),
         )
-        conn.commit()
 
     def count_polls_by_status(self, status: str) -> int:
         conn = self._get_connection()
@@ -282,6 +301,11 @@ class ArchonStore:
             "SELECT COUNT(*) AS cnt FROM archon_polls WHERE status = ?",
             (status,),
         ).fetchone()
+        return int(row["cnt"] or 0)
+
+    def count_total_polls(self) -> int:
+        conn = self._get_connection()
+        row = conn.execute("SELECT COUNT(*) AS cnt FROM archon_polls").fetchone()
         return int(row["cnt"] or 0)
 
     def list_votes_for_poll(self, poll_id: str) -> List[Dict[str, Any]]:
@@ -312,10 +336,14 @@ class ArchonStore:
                 """,
                 (vote_id, poll_id, voter_id, choice, reason, voted_at, signature),
             )
-            conn.commit()
             return cursor.rowcount > 0
         except sqlite3.IntegrityError:
             return False
+
+    def count_total_votes(self) -> int:
+        conn = self._get_connection()
+        row = conn.execute("SELECT COUNT(*) AS cnt FROM archon_votes").fetchone()
+        return int(row["cnt"] or 0)
 
     def list_votes_for_voter(self, voter_id: str, limit: int) -> List[Dict[str, Any]]:
         conn = self._get_connection()
@@ -399,6 +427,14 @@ class ArchonService:
 
     VALID_GOVERNANCE_TIERS = {"basic", "governance"}
 
+    MAX_LABEL_LEN = 120
+    MAX_POLL_TYPE_LEN = 32
+    MAX_POLL_TITLE_LEN = 200
+    MAX_METADATA_JSON_LEN = 8_192
+    MAX_REASON_LEN = 500
+    MAX_TOTAL_POLLS = 5_000
+    MAX_TOTAL_VOTES = 50_000
+
     def __init__(
         self,
         store: ArchonStore,
@@ -413,11 +449,17 @@ class ArchonService:
         self.rpc = rpc
         self._logger = logger
         self.gateway_url = gateway_url.strip()
-        self.network_enabled = network_enabled
+        self.network_enabled = bool(network_enabled)
         self.min_governance_bond_sats = max(1, int(min_governance_bond_sats))
         self._time_fn = time_fn
+
+        if self.network_enabled and not self._is_valid_gateway_url(self.gateway_url):
+            self._log("archon: invalid gateway URL; disabling network integration", "warn")
+            self.network_enabled = False
+            self.gateway_url = ""
+
         self._gateway_client = (
-            ArchonGatewayClient(self.gateway_url) if self.gateway_url else None
+            ArchonGatewayClient(self.gateway_url) if self.network_enabled and self.gateway_url else None
         )
         self.store.initialize()
 
@@ -427,6 +469,16 @@ class ArchonService:
 
     def _now(self) -> int:
         return int(self._time_fn())
+
+    def _is_valid_gateway_url(self, url: str) -> bool:
+        if not isinstance(url, str) or not url.strip():
+            return False
+        parsed = urlparse(url)
+        if parsed.scheme not in ("https", "http"):
+            return False
+        if not parsed.netloc:
+            return False
+        return True
 
     def _our_node_pubkey(self) -> str:
         if not self.rpc:
@@ -454,7 +506,7 @@ class ArchonService:
 
     def _resolve_did(self, did: str = "") -> str:
         if did:
-            return did
+            return did.strip()
         identity = self.store.get_identity()
         return str(identity.get("did", "")) if identity else ""
 
@@ -494,6 +546,12 @@ class ArchonService:
         return None
 
     def provision(self, force: bool = False, label: str = "") -> Dict[str, Any]:
+        if not isinstance(label, str):
+            return {"error": "label must be a string"}
+        label = label.strip()
+        if len(label) > self.MAX_LABEL_LEN:
+            return {"error": f"label too long (max {self.MAX_LABEL_LEN} chars)"}
+
         identity = self.store.get_identity()
         if identity and not force:
             return {
@@ -546,9 +604,14 @@ class ArchonService:
         if not _is_valid_nostr_pubkey(nostr_pubkey):
             return {"error": "invalid nostr_pubkey (expected 64 hex chars)"}
 
+        if did and not _is_valid_did(did):
+            return {"error": "invalid did format"}
+
         resolved_did = self._resolve_did(did)
         if not resolved_did:
             return {"error": "identity not provisioned", "hint": "run hive-archon-provision"}
+        if not _is_valid_did(resolved_did):
+            return {"error": "invalid did format"}
 
         attestation = self._build_attestation("nostr", resolved_did, nostr_pubkey)
         binding_id = hashlib.sha256(
@@ -573,13 +636,19 @@ class ArchonService:
         }
 
     def bind_cln(self, cln_pubkey: str = "", did: str = "") -> Dict[str, Any]:
-        subject = cln_pubkey or self._our_node_pubkey()
+        subject = cln_pubkey.strip() if isinstance(cln_pubkey, str) else cln_pubkey
+        subject = subject or self._our_node_pubkey()
         if not _is_valid_cln_pubkey(subject):
             return {"error": "invalid cln_pubkey (expected 66-char compressed secp256k1 pubkey)"}
+
+        if did and not _is_valid_did(did):
+            return {"error": "invalid did format"}
 
         resolved_did = self._resolve_did(did)
         if not resolved_did:
             return {"error": "identity not provisioned", "hint": "run hive-archon-provision"}
+        if not _is_valid_did(resolved_did):
+            return {"error": "invalid did format"}
 
         attestation = self._build_attestation("cln", resolved_did, subject)
         binding_id = hashlib.sha256(
@@ -619,6 +688,8 @@ class ArchonService:
             "bindings": binding_summary,
             "active_polls": self.store.count_polls_by_status("active"),
             "completed_polls": self.store.count_polls_by_status("completed"),
+            "total_polls": self.store.count_total_polls(),
+            "total_votes": self.store.count_total_votes(),
             "network_enabled": self.network_enabled,
             "gateway_url": self.gateway_url,
             "min_governance_bond_sats": self.min_governance_bond_sats,
@@ -642,7 +713,7 @@ class ArchonService:
             }
 
         self.store.update_governance_tier(target_tier, self._now())
-        identity = self.store.get_identity()
+        identity = self.store.get_identity() or {}
         return {
             "ok": True,
             "did": identity.get("did", ""),
@@ -668,8 +739,8 @@ class ArchonService:
 
     def _refresh_poll_state(self, poll: Dict[str, Any]) -> Dict[str, Any]:
         if poll.get("status") == "active" and int(poll.get("deadline") or 0) <= self._now():
-            self.store.set_poll_status(poll["poll_id"], "completed", self._now())
-            updated = self.store.get_poll(poll["poll_id"])
+            self.store.set_poll_status(str(poll["poll_id"]), "completed", self._now())
+            updated = self.store.get_poll(str(poll["poll_id"]))
             return updated or poll
         return poll
 
@@ -685,10 +756,19 @@ class ArchonService:
         if tier_error:
             return tier_error
 
-        if not isinstance(poll_type, str) or not poll_type.strip() or len(poll_type) > 32:
+        if self.store.count_total_polls() >= self.MAX_TOTAL_POLLS:
+            return {"error": "poll capacity reached"}
+
+        if not isinstance(poll_type, str):
+            return {"error": "invalid poll_type"}
+        poll_type = poll_type.strip()
+        if not poll_type or len(poll_type) > self.MAX_POLL_TYPE_LEN:
             return {"error": "invalid poll_type"}
 
-        if not isinstance(title, str) or not title.strip() or len(title) > 200:
+        if not isinstance(title, str):
+            return {"error": "invalid title"}
+        title = title.strip()
+        if not title or len(title) > self.MAX_POLL_TITLE_LEN:
             return {"error": "invalid title"}
 
         if not isinstance(deadline, int) or deadline <= self._now():
@@ -701,6 +781,12 @@ class ArchonService:
         metadata = metadata or {}
         if not isinstance(metadata, dict):
             return {"error": "metadata must be an object"}
+        try:
+            metadata_json = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return {"error": "metadata must be JSON-serializable"}
+        if len(metadata_json) > self.MAX_METADATA_JSON_LEN:
+            return {"error": f"metadata too large (max {self.MAX_METADATA_JSON_LEN} bytes)"}
 
         identity = self.store.get_identity() or {}
         created_by = str(identity.get("did") or self._our_node_pubkey() or "local-node")
@@ -730,7 +816,7 @@ class ArchonService:
             poll_type=poll_type,
             title=title,
             options_json=json.dumps(cleaned_options, sort_keys=True, separators=(",", ":")),
-            metadata_json=json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            metadata_json=metadata_json,
             created_by=created_by,
             deadline=deadline,
             now_ts=now_ts,
@@ -797,14 +883,23 @@ class ArchonService:
         if tier_error:
             return tier_error
 
+        if self.store.count_total_votes() >= self.MAX_TOTAL_VOTES:
+            return {"error": "vote capacity reached"}
+
         if not isinstance(poll_id, str) or not poll_id:
             return {"error": "poll_id is required"}
 
-        if not isinstance(choice, str) or not choice.strip():
+        if not isinstance(choice, str):
+            return {"error": "choice is required"}
+        choice = choice.strip()
+        if not choice:
             return {"error": "choice is required"}
 
         if not isinstance(reason, str):
             return {"error": "reason must be a string"}
+        reason = reason.strip()
+        if len(reason) > self.MAX_REASON_LEN:
+            return {"error": f"reason too long (max {self.MAX_REASON_LEN} chars)"}
 
         poll = self.store.get_poll(poll_id)
         if not poll:

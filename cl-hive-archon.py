@@ -25,21 +25,18 @@ plugin.add_option(
     name="hive-archon-gateway",
     default="https://archon.technology",
     description="Archon gateway base URL",
-    dynamic=True,
 )
 
 plugin.add_option(
     name="hive-archon-network-enabled",
     default="false",
     description="Enable Archon gateway HTTP calls (default false for dark launch)",
-    dynamic=True,
 )
 
 plugin.add_option(
     name="hive-archon-governance-min-bond",
     default="50000",
     description="Minimum bond (sats) required to upgrade to governance tier",
-    dynamic=True,
 )
 
 
