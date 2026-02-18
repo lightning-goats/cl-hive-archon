@@ -1,0 +1,2 @@
+pyln-client>=25.0
+pytest>=8.0.0
