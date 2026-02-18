@@ -9,9 +9,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules.archon_service import ArchonService, ArchonStore
 
 
+class _MockRpc:
+    """Minimal RPC mock that provides signmessage and getinfo."""
+
+    def __init__(self, pubkey: str = "02" + "ab" * 32):
+        self._pubkey = pubkey
+
+    def getinfo(self):
+        return {"id": self._pubkey}
+
+    def signmessage(self, message: str):
+        return {"zbase": "mock_sig_" + message[:16]}
+
+
 def _make_service(tmp_path, **kwargs):
     db_path = str(tmp_path / "archon.db")
     store = ArchonStore(db_path=db_path)
+    kwargs.setdefault("rpc", _MockRpc())
     return ArchonService(store=store, network_enabled=False, **kwargs)
 
 
@@ -189,3 +203,89 @@ def test_my_votes_returns_recent_votes(tmp_path):
     assert votes["ok"] is True
     assert votes["count"] == 2
     assert len(votes["votes"]) == 2
+
+
+def test_bind_rejects_foreign_did(tmp_path):
+    service = _make_service(tmp_path)
+    service.provision()
+
+    foreign_did = "did:cid:" + "ff" * 24
+    res = service.bind_nostr("ab" * 32, did=foreign_did)
+    assert "error" in res
+    assert "not owned" in res["error"]
+
+    res2 = service.bind_cln("02" + "cd" * 32, did=foreign_did)
+    assert "error" in res2
+    assert "not owned" in res2["error"]
+
+
+def test_bind_rejects_explicit_did_without_identity(tmp_path):
+    service = _make_service(tmp_path)
+    unowned_did = "did:cid:" + "aa" * 24
+
+    res = service.bind_nostr("ab" * 32, did=unowned_did)
+    assert "error" in res
+    assert "identity not provisioned" in res["error"]
+
+    res2 = service.bind_cln("02" + "cd" * 32, did=unowned_did)
+    assert "error" in res2
+    assert "identity not provisioned" in res2["error"]
+
+
+def test_prune_completed_polls(tmp_path):
+    # Use a controllable time function so we can "age" polls
+    current_time = [time.time()]
+    service = _make_service(tmp_path, time_fn=lambda: current_time[0])
+    service.provision()
+    service.upgrade(target_tier="governance", bond_sats=100_000)
+
+    # Create a poll that expires in 1 second
+    create = service.poll_create(
+        poll_type="config",
+        title="Old poll",
+        options=["yes", "no"],
+        deadline=int(current_time[0]) + 1,
+        metadata={},
+    )
+    assert create["ok"] is True
+
+    # Advance time past deadline and retention without touching poll status.
+    current_time[0] += (100 * 86400) + 10
+    result = service.prune(retention_days=90)
+    assert result["ok"] is True
+    assert result["polls_completed"] >= 1
+    assert result["polls_removed"] >= 1
+
+    # Poll should be gone
+    status = service.poll_status(create["poll_id"])
+    assert "error" in status
+
+
+def test_gateway_validation_allows_local_http(tmp_path):
+    store = ArchonStore(db_path=str(tmp_path / "archon.db"))
+    service = ArchonService(
+        store=store,
+        rpc=_MockRpc(),
+        gateway_url="http://localhost:4224",
+        network_enabled=True,
+    )
+    assert service.network_enabled is True
+    assert service.gateway_url == "http://localhost:4224"
+
+
+def test_force_reprovision_cleans_bindings(tmp_path):
+    service = _make_service(tmp_path)
+    result = service.provision(label="first")
+    old_did = result["did"]
+
+    service.bind_nostr("ab" * 32)
+    bindings = service.store.list_bindings()
+    assert len(bindings) == 1
+    assert bindings[0]["did"] == old_did
+
+    # Force re-provision generates new DID, should clean old bindings
+    result2 = service.provision(force=True, label="second")
+    assert result2["did"] != old_did
+
+    bindings_after = service.store.list_bindings()
+    assert len(bindings_after) == 0

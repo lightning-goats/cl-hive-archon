@@ -9,7 +9,6 @@ import sqlite3
 import threading
 import time
 import uuid
-import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
@@ -239,6 +238,14 @@ class ArchonStore:
             ),
         )
 
+    def delete_bindings_for_did(self, did: str) -> int:
+        """Remove all bindings associated with a DID. Returns count deleted."""
+        conn = self._get_connection()
+        cursor = conn.execute(
+            "DELETE FROM archon_bindings WHERE did = ?", (did,)
+        )
+        return cursor.rowcount
+
     def list_bindings(self) -> List[Dict[str, Any]]:
         conn = self._get_connection()
         rows = conn.execute(
@@ -294,6 +301,19 @@ class ArchonStore:
             "UPDATE archon_polls SET status = ?, updated_at = ? WHERE poll_id = ?",
             (status, now_ts, poll_id),
         )
+
+    def complete_expired_polls(self, now_ts: int) -> int:
+        """Transition expired active polls to completed and return count."""
+        conn = self._get_connection()
+        cursor = conn.execute(
+            """
+            UPDATE archon_polls
+            SET status = 'completed', updated_at = ?
+            WHERE status = 'active' AND deadline <= ?
+            """,
+            (now_ts, now_ts),
+        )
+        return cursor.rowcount
 
     def count_polls_by_status(self, status: str) -> int:
         conn = self._get_connection()
@@ -360,6 +380,28 @@ class ArchonStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def prune_completed_polls(self, before_ts: int) -> int:
+        """Delete completed polls (and their votes) older than before_ts.
+
+        Returns the number of polls deleted.
+        """
+        conn = self._get_connection()
+        # Delete votes first (foreign key constraint)
+        conn.execute(
+            """
+            DELETE FROM archon_votes WHERE poll_id IN (
+                SELECT poll_id FROM archon_polls
+                WHERE status = 'completed' AND deadline < ?
+            )
+            """,
+            (before_ts,),
+        )
+        cursor = conn.execute(
+            "DELETE FROM archon_polls WHERE status = 'completed' AND deadline < ?",
+            (before_ts,),
+        )
+        return cursor.rowcount
+
 
 class ArchonGatewayClient:
     """Small HTTP client for optional Archon gateway integration."""
@@ -412,13 +454,15 @@ class ArchonGatewayClient:
         return None
 
     def submit_vote(self, poll_id: str, voter_id: str, choice: str, reason: str) -> bool:
+        from urllib.parse import quote as _url_quote
         payload = {
             "poll_id": poll_id,
             "voter_id": voter_id,
             "choice": choice,
             "reason": reason,
         }
-        data = self._request("POST", f"/v1/hive/polls/{poll_id}/votes", payload)
+        safe_poll_id = _url_quote(poll_id, safe="")
+        data = self._request("POST", f"/v1/hive/polls/{safe_poll_id}/votes", payload)
         return bool(data.get("ok", False))
 
 
@@ -478,6 +522,8 @@ class ArchonService:
             return False
         if not parsed.netloc:
             return False
+        if not parsed.hostname:
+            return False
         return True
 
     def _our_node_pubkey(self) -> str:
@@ -493,15 +539,29 @@ class ArchonService:
             self._log(f"archon: getinfo failed: {exc}", "warn")
         return ""
 
-    def _sign_message(self, payload: str) -> str:
+    def _sign_message(self, payload: str, required: bool = False) -> str:
+        """Sign a message via CLN HSM.
+
+        Args:
+            payload: The message to sign.
+            required: If True, raise on failure instead of returning "".
+        """
         if not self.rpc:
+            if required:
+                raise RuntimeError("RPC not available for signing")
             return ""
         try:
             result = self.rpc.signmessage(payload)
             if isinstance(result, dict):
-                return str(result.get("zbase", "") or "")
+                sig = str(result.get("zbase", "") or "")
+                if sig:
+                    return sig
         except Exception as exc:
             self._log(f"archon: signmessage failed: {exc}", "warn")
+            if required:
+                raise
+        if required:
+            raise RuntimeError("signmessage returned empty signature")
         return ""
 
     def _resolve_did(self, did: str = "") -> str:
@@ -524,7 +584,7 @@ class ArchonService:
             "timestamp": self._now(),
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        signature = self._sign_message(canonical)
+        signature = self._sign_message(canonical, required=True)
         return {
             "payload": payload,
             "signature": signature,
@@ -572,7 +632,7 @@ class ArchonService:
                 did = self._gateway_client.provision_identity(node_pubkey=node_pubkey, label=label)
                 if did:
                     source = "archon-gateway"
-            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+            except Exception as exc:
                 self._log(f"archon: gateway provisioning failed, using local fallback: {exc}", "warn")
 
         if not did:
@@ -581,6 +641,12 @@ class ArchonService:
         governance_tier = "basic"
         if identity:
             governance_tier = str(identity.get("governance_tier") or "basic")
+            # Clean up bindings referencing the old DID when force-reprovisioning
+            old_did = str(identity.get("did") or "")
+            if old_did and old_did != did:
+                removed = self.store.delete_bindings_for_did(old_did)
+                if removed:
+                    self._log(f"archon: removed {removed} orphaned binding(s) for old DID", "info")
 
         now_ts = self._now()
         self.store.upsert_identity(
@@ -607,13 +673,24 @@ class ArchonService:
         if did and not _is_valid_did(did):
             return {"error": "invalid did format"}
 
+        identity = self.store.get_identity()
+        if not identity:
+            return {"error": "identity not provisioned", "hint": "run hive-archon-provision"}
+
         resolved_did = self._resolve_did(did)
         if not resolved_did:
             return {"error": "identity not provisioned", "hint": "run hive-archon-provision"}
         if not _is_valid_did(resolved_did):
             return {"error": "invalid did format"}
 
-        attestation = self._build_attestation("nostr", resolved_did, nostr_pubkey)
+        owned_did = str(identity.get("did") or "")
+        if resolved_did != owned_did:
+            return {"error": "cannot bind to a DID not owned by this node"}
+
+        try:
+            attestation = self._build_attestation("nostr", resolved_did, nostr_pubkey)
+        except RuntimeError as exc:
+            return {"error": f"signing failed: {exc}"}
         binding_id = hashlib.sha256(
             f"{resolved_did}:nostr:{nostr_pubkey}".encode("utf-8")
         ).hexdigest()[:32]
@@ -644,13 +721,24 @@ class ArchonService:
         if did and not _is_valid_did(did):
             return {"error": "invalid did format"}
 
+        identity = self.store.get_identity()
+        if not identity:
+            return {"error": "identity not provisioned", "hint": "run hive-archon-provision"}
+
         resolved_did = self._resolve_did(did)
         if not resolved_did:
             return {"error": "identity not provisioned", "hint": "run hive-archon-provision"}
         if not _is_valid_did(resolved_did):
             return {"error": "invalid did format"}
 
-        attestation = self._build_attestation("cln", resolved_did, subject)
+        owned_did = str(identity.get("did") or "")
+        if resolved_did != owned_did:
+            return {"error": "cannot bind to a DID not owned by this node"}
+
+        try:
+            attestation = self._build_attestation("cln", resolved_did, subject)
+        except RuntimeError as exc:
+            return {"error": f"signing failed: {exc}"}
         binding_id = hashlib.sha256(
             f"{resolved_did}:cln:{subject}".encode("utf-8")
         ).hexdigest()[:32]
@@ -764,6 +852,8 @@ class ArchonService:
         poll_type = poll_type.strip()
         if not poll_type or len(poll_type) > self.MAX_POLL_TYPE_LEN:
             return {"error": "invalid poll_type"}
+        if not all(ch.isalnum() or ch in "-_" for ch in poll_type):
+            return {"error": "invalid poll_type (alphanumeric, hyphens, underscores only)"}
 
         if not isinstance(title, str):
             return {"error": "invalid title"}
@@ -806,7 +896,7 @@ class ArchonService:
                 )
                 if remote:
                     remote_poll_id = remote
-            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+            except Exception as exc:
                 self._log(f"archon: remote poll creation failed; keeping local poll only: {exc}", "warn")
 
         now_ts = self._now()
@@ -929,7 +1019,10 @@ class ArchonService:
             sort_keys=True,
             separators=(",", ":"),
         )
-        signature = self._sign_message(canonical)
+        try:
+            signature = self._sign_message(canonical, required=True)
+        except RuntimeError as exc:
+            return {"error": f"vote signing failed: {exc}"}
 
         vote_id = hashlib.sha256(
             f"{poll_id}:{voter_id}:{choice}:{voted_at}".encode("utf-8")
@@ -957,7 +1050,7 @@ class ArchonService:
                     choice=choice,
                     reason=reason,
                 )
-            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+            except Exception as exc:
                 self._log(f"archon: remote vote submit failed (local vote preserved): {exc}", "warn")
 
         return {
@@ -982,4 +1075,18 @@ class ArchonService:
             "voter_id": voter_id,
             "count": len(votes),
             "votes": votes,
+        }
+
+    def prune(self, retention_days: int = 90) -> Dict[str, Any]:
+        if not isinstance(retention_days, int) or retention_days < 1:
+            return {"error": "retention_days must be a positive integer"}
+        now_ts = self._now()
+        completed = self.store.complete_expired_polls(now_ts=now_ts)
+        cutoff = now_ts - (retention_days * 86400)
+        removed = self.store.prune_completed_polls(before_ts=cutoff)
+        return {
+            "ok": True,
+            "polls_completed": completed,
+            "polls_removed": removed,
+            "retention_days": retention_days,
         }

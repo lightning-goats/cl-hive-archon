@@ -184,5 +184,11 @@ def hive_my_votes(plugin: Plugin, limit: int = 50) -> Dict[str, Any]:
     return _require_service().my_votes(limit=_parse_int(limit, 50))
 
 
+@plugin.method("hive-archon-prune")
+def hive_archon_prune(plugin: Plugin, retention_days: int = 90) -> Dict[str, Any]:
+    del plugin
+    return _require_service().prune(retention_days=_parse_int(retention_days, 90))
+
+
 if __name__ == "__main__":
     plugin.run()
