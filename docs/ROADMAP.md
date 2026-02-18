@@ -1,8 +1,13 @@
 # cl-hive-archon Roadmap
 
-Phase 6 scaffold created.
+## Current
+- Phase 6B standalone MVP implemented.
+- Local identity, binding, and governance poll workflows available via RPC.
+- Archon gateway integration path exists but is disabled by default.
 
-Next steps (deferred):
-1. Define module ownership boundaries.
-2. Add CI and release workflow.
-3. Implement plugin runtime only after Phase 6 readiness gates pass.
+## Next
+1. Add end-to-end CLN integration tests for plugin method registration.
+2. Add MCP server tool mappings for `hive-archon-*` methods.
+3. Integrate with `cl-hive-comms` DID transport hooks.
+4. Add production auth/rate-limit hardening for remote poll calls.
+5. Add release workflow and signed tags.
