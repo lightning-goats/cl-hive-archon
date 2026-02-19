@@ -93,6 +93,27 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         min_governance_bond_sats=min_bond,
     )
 
+    # Warn if cl-hive-comms is not detected (unsupported configuration)
+    comms_detected = False
+    try:
+        try:
+            plugins_resp = plugin.rpc.plugin("list")
+        except Exception:
+            plugins_resp = plugin.rpc.listplugins()
+        for entry in plugins_resp.get("plugins", []):
+            raw_name = entry.get("name") or entry.get("path") or entry.get("plugin") or ""
+            if "cl-hive-comms" in os.path.basename(str(raw_name)).lower():
+                comms_detected = bool(entry.get("active", False))
+                break
+    except Exception:
+        pass
+    if not comms_detected:
+        plugin.log(
+            "WARNING: cl-hive-comms not detected. cl-hive-archon without cl-hive-comms "
+            "is not a supported Phase 6 configuration.",
+            level="warn",
+        )
+
     plugin.log(
         "cl-hive-archon initialized "
         f"(db_path={db_path}, network_enabled={network_enabled}, gateway={gateway_url})"

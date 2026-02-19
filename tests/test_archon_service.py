@@ -289,3 +289,88 @@ def test_force_reprovision_cleans_bindings(tmp_path):
 
     bindings_after = service.store.list_bindings()
     assert len(bindings_after) == 0
+
+
+def test_status_returns_full_state(tmp_path):
+    service = _make_service(tmp_path)
+    service.provision()
+    service.bind_nostr("ab" * 32)
+    status = service.status()
+    assert status["ok"] is True
+    assert status["identity"] is not None
+    assert status["identity"]["did"].startswith("did:cid:")
+    assert "bindings" in status
+    assert status["bindings"]["nostr"] >= 1
+    assert status["network_enabled"] is False
+
+
+def test_upgrade_rejects_invalid_tier(tmp_path):
+    service = _make_service(tmp_path)
+    service.provision()
+    result = service.upgrade(target_tier="admin")
+    assert "error" in result
+    assert "invalid target_tier" in result["error"]
+
+
+def test_vote_rejects_invalid_choice(tmp_path):
+    service = _make_service(tmp_path)
+    service.provision()
+    service.upgrade(target_tier="governance", bond_sats=100_000)
+    create = service.poll_create(
+        poll_type="config", title="Test", options=["yes", "no"],
+        deadline=int(time.time()) + 3600,
+    )
+    assert create["ok"] is True
+    result = service.vote(create["poll_id"], "maybe")
+    assert "error" in result
+
+
+def test_poll_create_rejects_invalid_poll_type(tmp_path):
+    service = _make_service(tmp_path)
+    service.provision()
+    service.upgrade(target_tier="governance", bond_sats=100_000)
+    result = service.poll_create(
+        poll_type="config; DROP TABLE",
+        title="Bad",
+        options=["yes", "no"],
+        deadline=int(time.time()) + 3600,
+    )
+    assert "error" in result
+
+
+def test_gateway_rejects_private_ips(tmp_path):
+    """SSRF protection: private IPs should be rejected."""
+    service = _make_service(tmp_path)
+    assert service._is_valid_gateway_url("http://169.254.169.254/latest/meta-data/") is False
+    assert service._is_valid_gateway_url("http://10.0.0.1/api") is False
+    assert service._is_valid_gateway_url("http://192.168.1.1/api") is False
+    assert service._is_valid_gateway_url("http://172.16.0.1/api") is False
+    # HTTP only allowed for localhost
+    assert service._is_valid_gateway_url("http://example.com/api") is False
+    assert service._is_valid_gateway_url("https://example.com/api") is True
+    assert service._is_valid_gateway_url("http://localhost/api") is True
+
+
+def test_store_close(tmp_path):
+    """ArchonStore.close() releases the thread-local connection."""
+    db_path = str(tmp_path / "archon.db")
+    store = ArchonStore(db_path=db_path)
+    store.initialize()
+    conn = store._get_connection()
+    assert conn is not None
+    store.close()
+    assert getattr(store._local, "conn", None) is None
+
+
+def test_prune_rejects_invalid_retention(tmp_path):
+    service = _make_service(tmp_path)
+    assert "error" in service.prune(retention_days=0)
+    assert "error" in service.prune(retention_days=-5)
+
+
+def test_upgrade_bond_sats_type_coercion(tmp_path):
+    service = _make_service(tmp_path)
+    service.provision()
+    result = service.upgrade(target_tier="governance", bond_sats="not_a_number")
+    assert "error" in result
+    assert "bond" in result["error"].lower() or "insufficient" in result["error"].lower()

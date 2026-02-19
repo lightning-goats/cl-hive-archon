@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import sqlite3
+import ssl
 import threading
 import time
 import uuid
@@ -67,10 +69,10 @@ class ArchonStore:
         if conn is None:
             db_dir = os.path.dirname(self.db_path)
             if db_dir:
-                os.makedirs(db_dir, exist_ok=True)
+                os.makedirs(db_dir, mode=0o700, exist_ok=True)
             conn = sqlite3.connect(
                 self.db_path,
-                isolation_level=None,
+                isolation_level="DEFERRED",
                 timeout=30.0,
             )
             conn.row_factory = sqlite3.Row
@@ -79,9 +81,19 @@ class ArchonStore:
             self._local.conn = conn
             try:
                 os.chmod(self.db_path, 0o600)
-            except OSError:
-                pass
+            except OSError as exc:
+                self._log(f"archon: failed to set db permissions to 0o600: {exc}", "warn")
         return conn
+
+    def close(self) -> None:
+        """Close the thread-local database connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
 
     def initialize(self) -> None:
         conn = self._get_connection()
@@ -168,7 +180,7 @@ class ArchonStore:
             """
         )
 
-        conn.execute("PRAGMA optimize;")
+        # PRAGMA optimize is deferred to prune() where data exists
 
     def get_identity(self) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
@@ -391,25 +403,23 @@ class ArchonStore:
         Returns the number of polls deleted.
         """
         conn = self._get_connection()
-        conn.execute("BEGIN")
         try:
-            conn.execute(
-                """
-                DELETE FROM archon_votes WHERE poll_id IN (
-                    SELECT poll_id FROM archon_polls
-                    WHERE status = 'completed' AND deadline < ?
+            with conn:
+                conn.execute(
+                    """
+                    DELETE FROM archon_votes WHERE poll_id IN (
+                        SELECT poll_id FROM archon_polls
+                        WHERE status = 'completed' AND deadline < ?
+                    )
+                    """,
+                    (before_ts,),
                 )
-                """,
-                (before_ts,),
-            )
-            cursor = conn.execute(
-                "DELETE FROM archon_polls WHERE status = 'completed' AND deadline < ?",
-                (before_ts,),
-            )
-            conn.execute("COMMIT")
-            return cursor.rowcount
+                cursor = conn.execute(
+                    "DELETE FROM archon_polls WHERE status = 'completed' AND deadline < ?",
+                    (before_ts,),
+                )
+                return cursor.rowcount
         except Exception:
-            conn.execute("ROLLBACK")
             raise
 
 
@@ -428,7 +438,8 @@ class ArchonGatewayClient:
             headers={"Content-Type": "application/json"},
             method=method,
         )
-        with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=ctx) as response:
             raw = response.read().decode("utf-8")
             return json.loads(raw) if raw else {}
 
@@ -524,16 +535,39 @@ class ArchonService:
     def _now(self) -> int:
         return int(self._time_fn())
 
+    _BLOCKED_NETWORKS = [
+        ipaddress.ip_network("0.0.0.0/8"),
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("100.64.0.0/10"),
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("169.254.0.0/16"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("::1/128"),
+        ipaddress.ip_network("fc00::/7"),
+        ipaddress.ip_network("fe80::/10"),
+    ]
+
     def _is_valid_gateway_url(self, url: str) -> bool:
         if not isinstance(url, str) or not url.strip():
             return False
         parsed = urlparse(url)
         if parsed.scheme not in ("https", "http"):
             return False
-        if not parsed.netloc:
+        if not parsed.netloc or not parsed.hostname:
             return False
-        if not parsed.hostname:
+        hostname = parsed.hostname
+        # Allow HTTP only for localhost (dev/testing)
+        if parsed.scheme == "http" and hostname not in ("localhost", "127.0.0.1", "::1"):
             return False
+        # Block private/link-local/metadata IP ranges
+        try:
+            addr = ipaddress.ip_address(hostname)
+            for network in self._BLOCKED_NETWORKS:
+                if addr in network:
+                    return False
+        except ValueError:
+            pass  # hostname is a DNS name, not an IP literal — allowed
         return True
 
     def _our_node_pubkey(self) -> str:
@@ -724,7 +758,7 @@ class ArchonService:
         }
 
     def bind_cln(self, cln_pubkey: str = "", did: str = "") -> Dict[str, Any]:
-        subject = cln_pubkey.strip() if isinstance(cln_pubkey, str) else cln_pubkey
+        subject = str(cln_pubkey or "").strip()
         subject = subject or self._our_node_pubkey()
         if not _is_valid_cln_pubkey(subject):
             return {"error": "invalid cln_pubkey (expected 66-char compressed secp256k1 pubkey)"}
@@ -805,7 +839,11 @@ class ArchonService:
         if not identity:
             return {"error": "identity not provisioned", "hint": "run hive-archon-provision"}
 
-        if target_tier == "governance" and int(bond_sats) < self.min_governance_bond_sats:
+        try:
+            bond_sats = int(bond_sats)
+        except (TypeError, ValueError):
+            bond_sats = 0
+        if target_tier == "governance" and bond_sats < self.min_governance_bond_sats:
             return {
                 "error": "insufficient bond for governance tier",
                 "required_bond_sats": self.min_governance_bond_sats,
@@ -837,8 +875,14 @@ class ArchonService:
         return cleaned
 
     def _refresh_poll_state(self, poll: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(poll, dict) or not poll.get("poll_id"):
+            return poll if isinstance(poll, dict) else {}
         now_ts = self._now()
-        if poll.get("status") == "active" and int(poll.get("deadline") or 0) <= now_ts:
+        try:
+            deadline = int(poll.get("deadline") or 0)
+        except (TypeError, ValueError):
+            deadline = 0
+        if poll.get("status") == "active" and deadline <= now_ts:
             self.store.set_poll_status(str(poll["poll_id"]), "completed", now_ts)
             updated = self.store.get_poll(str(poll["poll_id"]))
             return updated or poll
@@ -1098,6 +1142,10 @@ class ArchonService:
         completed = self.store.complete_expired_polls(now_ts=now_ts)
         cutoff = now_ts - (retention_days * 86400)
         removed = self.store.prune_completed_polls(before_ts=cutoff)
+        try:
+            self.store._get_connection().execute("PRAGMA optimize;")
+        except Exception:
+            pass
         return {
             "ok": True,
             "polls_completed": completed,
