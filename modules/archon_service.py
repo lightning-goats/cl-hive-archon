@@ -77,6 +77,10 @@ class ArchonStore:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA foreign_keys=ON;")
             self._local.conn = conn
+            try:
+                os.chmod(self.db_path, 0o600)
+            except OSError:
+                pass
         return conn
 
     def initialize(self) -> None:
