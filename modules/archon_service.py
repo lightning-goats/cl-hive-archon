@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
+import socket
 import sqlite3
+import ssl
 import threading
 import time
 import uuid
@@ -50,6 +53,20 @@ def _is_valid_did(value: str) -> bool:
     return all(ch.isalnum() or ch in "-._:" for ch in suffix)
 
 
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+
 class ArchonStore:
     """SQLite persistence for archon identity, bindings, polls, and votes."""
 
@@ -67,17 +84,31 @@ class ArchonStore:
         if conn is None:
             db_dir = os.path.dirname(self.db_path)
             if db_dir:
-                os.makedirs(db_dir, exist_ok=True)
+                os.makedirs(db_dir, mode=0o700, exist_ok=True)
             conn = sqlite3.connect(
                 self.db_path,
-                isolation_level=None,
+                isolation_level="DEFERRED",
                 timeout=30.0,
             )
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA foreign_keys=ON;")
             self._local.conn = conn
+            try:
+                os.chmod(self.db_path, 0o600)
+            except OSError as exc:
+                self._log(f"archon: failed to set db permissions to 0o600: {exc}", "warn")
         return conn
+
+    def close(self) -> None:
+        """Close the thread-local database connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
 
     def initialize(self) -> None:
         conn = self._get_connection()
@@ -164,7 +195,29 @@ class ArchonStore:
             """
         )
 
-        conn.execute("PRAGMA optimize;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS archon_outbox (
+                entry_id TEXT PRIMARY KEY,
+                operation TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 5,
+                created_at INTEGER NOT NULL,
+                next_retry_at INTEGER NOT NULL,
+                last_error TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_archon_outbox_pending
+            ON archon_outbox(status, next_retry_at)
+            """
+        )
+
+        # PRAGMA optimize is deferred to prune() where data exists
 
     def get_identity(self) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
@@ -194,6 +247,7 @@ class ArchonStore:
             """,
             (did, governance_tier, status, source, gateway_url, created_at, now_ts),
         )
+        conn.commit()
 
     def update_governance_tier(self, governance_tier: str, now_ts: int) -> None:
         conn = self._get_connection()
@@ -201,6 +255,7 @@ class ArchonStore:
             "UPDATE archon_identity SET governance_tier = ?, updated_at = ? WHERE singleton_id = 1",
             (governance_tier, now_ts),
         )
+        conn.commit()
 
     def upsert_binding(
         self,
@@ -237,6 +292,7 @@ class ArchonStore:
                 now_ts,
             ),
         )
+        conn.commit()
 
     def delete_bindings_for_did(self, did: str) -> int:
         """Remove all bindings associated with a DID. Returns count deleted."""
@@ -244,6 +300,7 @@ class ArchonStore:
         cursor = conn.execute(
             "DELETE FROM archon_bindings WHERE did = ?", (did,)
         )
+        conn.commit()
         return cursor.rowcount
 
     def list_bindings(self, limit: int = 1000) -> List[Dict[str, Any]]:
@@ -287,6 +344,7 @@ class ArchonStore:
                 now_ts,
             ),
         )
+        conn.commit()
 
     def get_poll(self, poll_id: str) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
@@ -302,6 +360,7 @@ class ArchonStore:
             "UPDATE archon_polls SET status = ?, updated_at = ? WHERE poll_id = ?",
             (status, now_ts, poll_id),
         )
+        conn.commit()
 
     def complete_expired_polls(self, now_ts: int) -> int:
         """Transition expired active polls to completed and return count."""
@@ -314,6 +373,7 @@ class ArchonStore:
             """,
             (now_ts, now_ts),
         )
+        conn.commit()
         return cursor.rowcount
 
     def count_polls_by_status(self, status: str) -> int:
@@ -357,6 +417,7 @@ class ArchonStore:
                 """,
                 (vote_id, poll_id, voter_id, choice, reason, voted_at, signature),
             )
+            conn.commit()
             return cursor.rowcount > 0
         except sqlite3.IntegrityError:
             return False
@@ -387,26 +448,96 @@ class ArchonStore:
         Returns the number of polls deleted.
         """
         conn = self._get_connection()
-        conn.execute("BEGIN")
         try:
-            conn.execute(
-                """
-                DELETE FROM archon_votes WHERE poll_id IN (
-                    SELECT poll_id FROM archon_polls
-                    WHERE status = 'completed' AND deadline < ?
+            with conn:
+                conn.execute(
+                    """
+                    DELETE FROM archon_votes WHERE poll_id IN (
+                        SELECT poll_id FROM archon_polls
+                        WHERE status = 'completed' AND deadline < ?
+                    )
+                    """,
+                    (before_ts,),
                 )
-                """,
-                (before_ts,),
-            )
-            cursor = conn.execute(
-                "DELETE FROM archon_polls WHERE status = 'completed' AND deadline < ?",
-                (before_ts,),
-            )
-            conn.execute("COMMIT")
-            return cursor.rowcount
+                cursor = conn.execute(
+                    "DELETE FROM archon_polls WHERE status = 'completed' AND deadline < ?",
+                    (before_ts,),
+                )
+                return cursor.rowcount
         except Exception:
-            conn.execute("ROLLBACK")
             raise
+
+    # ------------------------------------------------------------------
+    # Outbox methods (reliable gateway sync)
+    # ------------------------------------------------------------------
+
+    def add_outbox_entry(
+        self,
+        entry_id: str,
+        operation: str,
+        payload_json: str,
+        now_ts: int,
+        max_retries: int = 5,
+    ) -> None:
+        conn = self._get_connection()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO archon_outbox
+                (entry_id, operation, payload_json, status, retry_count,
+                 max_retries, created_at, next_retry_at)
+            VALUES (?, ?, ?, 'pending', 0, ?, ?, ?)
+            """,
+            (entry_id, operation, payload_json, max_retries, now_ts, now_ts),
+        )
+        conn.commit()
+
+    def list_outbox_pending(self, now_ts: int, limit: int = 50) -> List[Dict[str, Any]]:
+        conn = self._get_connection()
+        rows = conn.execute(
+            """
+            SELECT * FROM archon_outbox
+            WHERE status = 'pending' AND next_retry_at <= ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (now_ts, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_outbox_success(self, entry_id: str) -> None:
+        conn = self._get_connection()
+        conn.execute(
+            "UPDATE archon_outbox SET status = 'completed' WHERE entry_id = ?",
+            (entry_id,),
+        )
+        conn.commit()
+
+    def mark_outbox_failed(self, entry_id: str, error: str, next_retry_at: int) -> None:
+        conn = self._get_connection()
+        conn.execute(
+            """
+            UPDATE archon_outbox
+            SET retry_count = retry_count + 1,
+                last_error = ?,
+                next_retry_at = ?,
+                status = CASE
+                    WHEN retry_count + 1 >= max_retries THEN 'exhausted'
+                    ELSE 'pending'
+                END
+            WHERE entry_id = ?
+            """,
+            (error, next_retry_at, entry_id),
+        )
+        conn.commit()
+
+    def prune_outbox(self, before_ts: int) -> int:
+        conn = self._get_connection()
+        cursor = conn.execute(
+            "DELETE FROM archon_outbox WHERE status IN ('completed', 'exhausted') AND created_at < ?",
+            (before_ts,),
+        )
+        conn.commit()
+        return cursor.rowcount
 
 
 class ArchonGatewayClient:
@@ -416,7 +547,35 @@ class ArchonGatewayClient:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
 
+    def _resolve_and_check(self, hostname: str) -> None:
+        try:
+            # Resolve to IP (IPv4 or IPv6)
+            info = socket.getaddrinfo(hostname, None)
+            ips = [item[4][0] for item in info]
+        except OSError:
+            # If resolution fails, let urllib handle it (or fail)
+            return
+
+        for ip_str in ips:
+            try:
+                addr = ipaddress.ip_address(ip_str)
+            except ValueError:
+                continue
+            if addr.is_loopback:
+                continue
+            for network in _BLOCKED_NETWORKS:
+                if addr in network:
+                    raise ValueError(f"blocked IP: {addr}")
+
     def _request(self, method: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # Perform DNS check before request to mitigate rebinding (TOCTOU remains but window is small)
+        parsed = urlparse(self.base_url)
+        if parsed.hostname:
+            try:
+                self._resolve_and_check(parsed.hostname)
+            except ValueError as e:
+                return {}  # Fail silently or log? Returning empty dict is consistent with fail-closed here
+
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         req = urllib.request.Request(
             f"{self.base_url}{path}",
@@ -424,7 +583,8 @@ class ArchonGatewayClient:
             headers={"Content-Type": "application/json"},
             method=method,
         )
-        with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=ctx) as response:
             raw = response.read().decode("utf-8")
             return json.loads(raw) if raw else {}
 
@@ -526,10 +686,20 @@ class ArchonService:
         parsed = urlparse(url)
         if parsed.scheme not in ("https", "http"):
             return False
-        if not parsed.netloc:
+        if not parsed.netloc or not parsed.hostname:
             return False
-        if not parsed.hostname:
+        hostname = parsed.hostname
+        # Allow HTTP only for localhost (dev/testing)
+        if parsed.scheme == "http" and hostname not in ("localhost", "127.0.0.1", "::1"):
             return False
+        # Block private/link-local/metadata IP ranges
+        try:
+            addr = ipaddress.ip_address(hostname)
+            for network in _BLOCKED_NETWORKS:
+                if addr in network:
+                    return False
+        except ValueError:
+            pass  # hostname is a DNS name, not an IP literal — allowed
         return True
 
     def _our_node_pubkey(self) -> str:
@@ -569,6 +739,18 @@ class ArchonService:
         if required:
             raise RuntimeError("signmessage returned empty signature")
         return ""
+
+    MAX_SIGN_MESSAGE_LEN = 16384  # 16 KB
+
+    def sign_message(self, message: str) -> Dict[str, Any]:
+        """Sign a message using the identity key (public wrapper)."""
+        if not isinstance(message, str) or len(message) > self.MAX_SIGN_MESSAGE_LEN:
+            return {"error": f"message must be a string of at most {self.MAX_SIGN_MESSAGE_LEN} bytes"}
+        try:
+            sig = self._sign_message(message, required=True)
+            return {"ok": True, "signature": sig}
+        except Exception as e:
+            return {"error": str(e)}
 
     def _resolve_did(self, did: str = "") -> str:
         if did:
@@ -641,6 +823,11 @@ class ArchonService:
                     source = "archon-gateway"
             except Exception as exc:
                 self._log(f"archon: gateway provisioning failed, using local fallback: {exc}", "warn")
+                # Queue for retry via outbox
+                self._queue_outbox("provision", {
+                    "node_pubkey": node_pubkey,
+                    "label": label,
+                })
 
         if not did:
             did = self._generate_local_did(node_pubkey=node_pubkey, label=label)
@@ -720,7 +907,7 @@ class ArchonService:
         }
 
     def bind_cln(self, cln_pubkey: str = "", did: str = "") -> Dict[str, Any]:
-        subject = cln_pubkey.strip() if isinstance(cln_pubkey, str) else cln_pubkey
+        subject = str(cln_pubkey or "").strip()
         subject = subject or self._our_node_pubkey()
         if not _is_valid_cln_pubkey(subject):
             return {"error": "invalid cln_pubkey (expected 66-char compressed secp256k1 pubkey)"}
@@ -790,6 +977,42 @@ class ArchonService:
             "min_governance_bond_sats": self.min_governance_bond_sats,
         }
 
+    def _verify_bond(self, bond_sats: int) -> Dict[str, Any]:
+        """Verify that the node has sufficient channel capacity to back the bond.
+
+        Uses total local channel balance as proof-of-stake.  This is a
+        lightweight heuristic — a full implementation would require on-chain
+        UTXO verification or a dedicated bond-locking mechanism.
+        """
+        if not self.rpc:
+            return {"verified": False, "reason": "rpc unavailable"}
+        try:
+            funds = self.rpc.listfunds()
+            if not isinstance(funds, dict):
+                return {"verified": False, "reason": "unexpected listfunds response"}
+            # Sum local channel balances (our_amount_msat) as proof of stake
+            total_local_msat = 0
+            for ch in funds.get("channels", []):
+                amt = ch.get("our_amount_msat")
+                if amt is not None:
+                    # Handle both int and Millisatoshi string ("1000msat")
+                    try:
+                        total_local_msat += int(str(amt).replace("msat", ""))
+                    except (TypeError, ValueError):
+                        pass
+            total_local_sats = total_local_msat // 1000
+            if total_local_sats >= bond_sats:
+                return {"verified": True, "local_balance_sats": total_local_sats}
+            return {
+                "verified": False,
+                "reason": "insufficient channel balance",
+                "local_balance_sats": total_local_sats,
+                "required_sats": bond_sats,
+            }
+        except Exception as exc:
+            self._log(f"archon: bond verification failed: {exc}", "warn")
+            return {"verified": False, "reason": str(exc)}
+
     def upgrade(self, target_tier: str = "governance", bond_sats: int = 0) -> Dict[str, Any]:
         if target_tier not in self.VALID_GOVERNANCE_TIERS:
             return {
@@ -801,11 +1024,26 @@ class ArchonService:
         if not identity:
             return {"error": "identity not provisioned", "hint": "run hive-archon-provision"}
 
-        if target_tier == "governance" and int(bond_sats) < self.min_governance_bond_sats:
+        try:
+            bond_sats = int(bond_sats)
+        except (TypeError, ValueError):
+            bond_sats = 0
+        if target_tier == "governance" and bond_sats < self.min_governance_bond_sats:
             return {
                 "error": "insufficient bond for governance tier",
                 "required_bond_sats": self.min_governance_bond_sats,
             }
+
+        # Verify bond is backed by actual channel capacity
+        if target_tier == "governance":
+            verification = self._verify_bond(bond_sats)
+            if not verification.get("verified"):
+                return {
+                    "error": "bond verification failed",
+                    "reason": verification.get("reason", "unknown"),
+                    "required_bond_sats": self.min_governance_bond_sats,
+                    "local_balance_sats": verification.get("local_balance_sats", 0),
+                }
 
         self.store.update_governance_tier(target_tier, self._now())
         identity = self.store.get_identity() or {}
@@ -833,8 +1071,14 @@ class ArchonService:
         return cleaned
 
     def _refresh_poll_state(self, poll: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(poll, dict) or not poll.get("poll_id"):
+            return poll if isinstance(poll, dict) else {}
         now_ts = self._now()
-        if poll.get("status") == "active" and int(poll.get("deadline") or 0) <= now_ts:
+        try:
+            deadline = int(poll.get("deadline") or 0)
+        except (TypeError, ValueError):
+            deadline = 0
+        if poll.get("status") == "active" and deadline <= now_ts:
             self.store.set_poll_status(str(poll["poll_id"]), "completed", now_ts)
             updated = self.store.get_poll(str(poll["poll_id"]))
             return updated or poll
@@ -906,6 +1150,15 @@ class ArchonService:
                     remote_poll_id = remote
             except Exception as exc:
                 self._log(f"archon: remote poll creation failed; keeping local poll only: {exc}", "warn")
+                self._queue_outbox("create_poll", {
+                    "poll_id": poll_id,
+                    "poll_type": poll_type,
+                    "title": title,
+                    "options": cleaned_options,
+                    "deadline": deadline,
+                    "metadata": metadata,
+                    "creator": created_by,
+                })
 
         now_ts = self._now()
         self.store.create_poll(
@@ -969,12 +1222,18 @@ class ArchonService:
         }
 
     def _voter_id(self) -> str:
+        """Resolve voter identity.
+
+        Pinned to node pubkey (immutable across provisioning state changes)
+        to prevent sybil voting when DID is provisioned after first vote.
+        """
+        node_pubkey = self._our_node_pubkey()
+        if node_pubkey:
+            return node_pubkey
+        # Fallback: use DID if RPC is unavailable (e.g. testing)
         identity = self.store.get_identity() or {}
         did = str(identity.get("did") or "")
-        if did:
-            return did
-        node_pubkey = self._our_node_pubkey()
-        return node_pubkey if node_pubkey else "local-node"
+        return did if did else "local-node"
 
     def vote(self, poll_id: str, choice: str, reason: str = "") -> Dict[str, Any]:
         tier_error = self._require_governance()
@@ -1062,6 +1321,12 @@ class ArchonService:
                 )
             except Exception as exc:
                 self._log(f"archon: remote vote submit failed (local vote preserved): {exc}", "warn")
+                self._queue_outbox("submit_vote", {
+                    "remote_poll_id": remote_poll_id,
+                    "voter_id": voter_id,
+                    "choice": choice,
+                    "reason": reason,
+                })
 
         return {
             "ok": True,
@@ -1094,9 +1359,98 @@ class ArchonService:
         completed = self.store.complete_expired_polls(now_ts=now_ts)
         cutoff = now_ts - (retention_days * 86400)
         removed = self.store.prune_completed_polls(before_ts=cutoff)
+        outbox_pruned = self.store.prune_outbox(before_ts=cutoff)
+        try:
+            self.store._get_connection().execute("PRAGMA optimize;")
+        except Exception:
+            pass
         return {
             "ok": True,
             "polls_completed": completed,
             "polls_removed": removed,
+            "outbox_pruned": outbox_pruned,
             "retention_days": retention_days,
         }
+
+    # ------------------------------------------------------------------
+    # Outbox: reliable gateway sync
+    # ------------------------------------------------------------------
+
+    def _queue_outbox(self, operation: str, payload: Dict[str, Any]) -> None:
+        """Queue a gateway operation for later retry."""
+        if not self.network_enabled:
+            return
+        entry_id = hashlib.sha256(
+            f"{operation}:{json.dumps(payload, sort_keys=True)}:{self._now()}".encode()
+        ).hexdigest()[:32]
+        self.store.add_outbox_entry(
+            entry_id=entry_id,
+            operation=operation,
+            payload_json=json.dumps(payload, sort_keys=True),
+            now_ts=int(self._now()),
+        )
+
+    def process_outbox(self, max_entries: int = 10) -> Dict[str, Any]:
+        """Retry pending gateway operations. Returns counts."""
+        if not self.network_enabled or not self._gateway_client:
+            return {"processed": 0, "succeeded": 0, "failed": 0}
+        max_entries = max(1, min(max_entries, 100))
+        now_ts = int(self._now())
+        pending = self.store.list_outbox_pending(now_ts=now_ts, limit=max_entries)
+        succeeded = 0
+        failed = 0
+        for entry in pending:
+            op = entry["operation"]
+            try:
+                payload = json.loads(entry["payload_json"])
+            except (json.JSONDecodeError, TypeError):
+                self.store.mark_outbox_failed(entry["entry_id"], "bad payload", now_ts + 86400)
+                failed += 1
+                continue
+
+            try:
+                ok = self._execute_outbox_entry(op, payload)
+                capped_retries = min(entry["retry_count"], 20)
+                if ok:
+                    self.store.mark_outbox_success(entry["entry_id"])
+                    succeeded += 1
+                else:
+                    backoff = min(3600, 60 * (2 ** capped_retries))
+                    self.store.mark_outbox_failed(entry["entry_id"], "returned falsy", now_ts + backoff)
+                    failed += 1
+            except Exception as exc:
+                capped_retries = min(entry["retry_count"], 20)
+                backoff = min(3600, 60 * (2 ** capped_retries))
+                self.store.mark_outbox_failed(entry["entry_id"], str(exc)[:200], now_ts + backoff)
+                failed += 1
+
+        return {"processed": len(pending), "succeeded": succeeded, "failed": failed}
+
+    def _execute_outbox_entry(self, operation: str, payload: Dict[str, Any]) -> bool:
+        """Execute a single outbox operation against the gateway."""
+        if operation == "provision":
+            did = self._gateway_client.provision_identity(
+                node_pubkey=payload.get("node_pubkey", ""),
+                label=payload.get("label", ""),
+            )
+            return bool(did)
+        elif operation == "create_poll":
+            poll_id = self._gateway_client.create_poll(
+                poll_type=payload.get("poll_type", ""),
+                title=payload.get("title", ""),
+                options=payload.get("options", []),
+                deadline=payload.get("deadline", 0),
+                metadata=payload.get("metadata", {}),
+                creator=payload.get("creator", ""),
+            )
+            return bool(poll_id)
+        elif operation == "submit_vote":
+            return self._gateway_client.submit_vote(
+                poll_id=payload.get("remote_poll_id", ""),
+                voter_id=payload.get("voter_id", ""),
+                choice=payload.get("choice", ""),
+                reason=payload.get("reason", ""),
+            )
+        else:
+            self._log(f"archon: unknown outbox operation: {operation}", "warn")
+            return False

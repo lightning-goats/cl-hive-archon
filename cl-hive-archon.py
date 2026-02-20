@@ -93,6 +93,27 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         min_governance_bond_sats=min_bond,
     )
 
+    # Warn if cl-hive-comms is not detected (unsupported configuration)
+    comms_detected = False
+    try:
+        try:
+            plugins_resp = plugin.rpc.plugin("list")
+        except Exception:
+            plugins_resp = plugin.rpc.listplugins()
+        for entry in plugins_resp.get("plugins", []):
+            raw_name = entry.get("name") or entry.get("path") or entry.get("plugin") or ""
+            if "cl-hive-comms" in os.path.basename(str(raw_name)).lower():
+                comms_detected = bool(entry.get("active", False))
+                break
+    except Exception:
+        pass
+    if not comms_detected:
+        plugin.log(
+            "WARNING: cl-hive-comms not detected. cl-hive-archon without cl-hive-comms "
+            "is not a supported Phase 6 configuration.",
+            level="warn",
+        )
+
     plugin.log(
         "cl-hive-archon initialized "
         f"(db_path={db_path}, network_enabled={network_enabled}, gateway={gateway_url})"
@@ -184,10 +205,22 @@ def hive_my_votes(plugin: Plugin, limit: int = 50) -> Dict[str, Any]:
     return _require_service().my_votes(limit=_parse_int(limit, 50))
 
 
+@plugin.method("hive-archon-sign-message")
+def hive_archon_sign_message(plugin: Plugin, message: str) -> Dict[str, Any]:
+    del plugin
+    return _require_service().sign_message(message=message)
+
+
 @plugin.method("hive-archon-prune")
 def hive_archon_prune(plugin: Plugin, retention_days: int = 90) -> Dict[str, Any]:
     del plugin
     return _require_service().prune(retention_days=_parse_int(retention_days, 90))
+
+
+@plugin.method("hive-archon-process-outbox")
+def hive_archon_process_outbox(plugin: Plugin, max_entries: int = 10) -> Dict[str, Any]:
+    del plugin
+    return _require_service().process_outbox(max_entries=_parse_int(max_entries, 10))
 
 
 if __name__ == "__main__":
