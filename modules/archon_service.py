@@ -540,7 +540,7 @@ class ArchonGatewayClient:
             # Resolve to IP (IPv4 or IPv6)
             info = socket.getaddrinfo(hostname, None)
             ips = [item[4][0] for item in info]
-        except socket.gaierror:
+        except OSError:
             # If resolution fails, let urllib handle it (or fail)
             return
 
@@ -1393,15 +1393,17 @@ class ArchonService:
 
             try:
                 ok = self._execute_outbox_entry(op, payload)
+                capped_retries = min(entry["retry_count"], 20)
                 if ok:
                     self.store.mark_outbox_success(entry["entry_id"])
                     succeeded += 1
                 else:
-                    backoff = min(3600, 60 * (2 ** entry["retry_count"]))
+                    backoff = min(3600, 60 * (2 ** capped_retries))
                     self.store.mark_outbox_failed(entry["entry_id"], "returned falsy", now_ts + backoff)
                     failed += 1
             except Exception as exc:
-                backoff = min(3600, 60 * (2 ** entry["retry_count"]))
+                capped_retries = min(entry["retry_count"], 20)
+                backoff = min(3600, 60 * (2 ** capped_retries))
                 self.store.mark_outbox_failed(entry["entry_id"], str(exc)[:200], now_ts + backoff)
                 failed += 1
 
