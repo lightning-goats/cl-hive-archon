@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import ipaddress
 import json
@@ -761,8 +762,11 @@ class ArchonService:
 
     def _generate_local_did(self, node_pubkey: str, label: str) -> str:
         material = f"{node_pubkey}:{label}:{self._now()}:{uuid.uuid4()}"
-        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
-        return f"did:cid:{digest[:48]}"
+        digest = hashlib.sha256(material.encode("utf-8")).digest()
+        # CIDv1: version(1) + codec(0x0200 varint) + multihash(0x12 sha256, 0x20 len, digest)
+        cid_bytes = bytes([0x01, 0x80, 0x04, 0x12, 0x20]) + digest
+        cid_str = "b" + base64.b32encode(cid_bytes).decode("ascii").lower().rstrip("=")
+        return f"did:cid:{cid_str}"
 
     def _build_attestation(self, binding_type: str, did: str, subject: str) -> Dict[str, Any]:
         payload = {
