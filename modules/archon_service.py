@@ -247,6 +247,7 @@ class ArchonStore:
             """,
             (did, governance_tier, status, source, gateway_url, created_at, now_ts),
         )
+        conn.commit()
 
     def update_governance_tier(self, governance_tier: str, now_ts: int) -> None:
         conn = self._get_connection()
@@ -254,6 +255,7 @@ class ArchonStore:
             "UPDATE archon_identity SET governance_tier = ?, updated_at = ? WHERE singleton_id = 1",
             (governance_tier, now_ts),
         )
+        conn.commit()
 
     def upsert_binding(
         self,
@@ -290,6 +292,7 @@ class ArchonStore:
                 now_ts,
             ),
         )
+        conn.commit()
 
     def delete_bindings_for_did(self, did: str) -> int:
         """Remove all bindings associated with a DID. Returns count deleted."""
@@ -297,6 +300,7 @@ class ArchonStore:
         cursor = conn.execute(
             "DELETE FROM archon_bindings WHERE did = ?", (did,)
         )
+        conn.commit()
         return cursor.rowcount
 
     def list_bindings(self, limit: int = 1000) -> List[Dict[str, Any]]:
@@ -340,6 +344,7 @@ class ArchonStore:
                 now_ts,
             ),
         )
+        conn.commit()
 
     def get_poll(self, poll_id: str) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
@@ -355,6 +360,7 @@ class ArchonStore:
             "UPDATE archon_polls SET status = ?, updated_at = ? WHERE poll_id = ?",
             (status, now_ts, poll_id),
         )
+        conn.commit()
 
     def complete_expired_polls(self, now_ts: int) -> int:
         """Transition expired active polls to completed and return count."""
@@ -367,6 +373,7 @@ class ArchonStore:
             """,
             (now_ts, now_ts),
         )
+        conn.commit()
         return cursor.rowcount
 
     def count_polls_by_status(self, status: str) -> int:
@@ -410,6 +417,7 @@ class ArchonStore:
                 """,
                 (vote_id, poll_id, voter_id, choice, reason, voted_at, signature),
             )
+            conn.commit()
             return cursor.rowcount > 0
         except sqlite3.IntegrityError:
             return False
@@ -481,6 +489,7 @@ class ArchonStore:
             """,
             (entry_id, operation, payload_json, max_retries, now_ts, now_ts),
         )
+        conn.commit()
 
     def list_outbox_pending(self, now_ts: int, limit: int = 50) -> List[Dict[str, Any]]:
         conn = self._get_connection()
@@ -501,6 +510,7 @@ class ArchonStore:
             "UPDATE archon_outbox SET status = 'completed' WHERE entry_id = ?",
             (entry_id,),
         )
+        conn.commit()
 
     def mark_outbox_failed(self, entry_id: str, error: str, next_retry_at: int) -> None:
         conn = self._get_connection()
@@ -518,6 +528,7 @@ class ArchonStore:
             """,
             (error, next_retry_at, entry_id),
         )
+        conn.commit()
 
     def prune_outbox(self, before_ts: int) -> int:
         conn = self._get_connection()
@@ -525,6 +536,7 @@ class ArchonStore:
             "DELETE FROM archon_outbox WHERE status IN ('completed', 'exhausted') AND created_at < ?",
             (before_ts,),
         )
+        conn.commit()
         return cursor.rowcount
 
 
@@ -728,8 +740,12 @@ class ArchonService:
             raise RuntimeError("signmessage returned empty signature")
         return ""
 
+    MAX_SIGN_MESSAGE_LEN = 16384  # 16 KB
+
     def sign_message(self, message: str) -> Dict[str, Any]:
         """Sign a message using the identity key (public wrapper)."""
+        if not isinstance(message, str) or len(message) > self.MAX_SIGN_MESSAGE_LEN:
+            return {"error": f"message must be a string of at most {self.MAX_SIGN_MESSAGE_LEN} bytes"}
         try:
             sig = self._sign_message(message, required=True)
             return {"ok": True, "signature": sig}
@@ -1378,6 +1394,7 @@ class ArchonService:
         """Retry pending gateway operations. Returns counts."""
         if not self.network_enabled or not self._gateway_client:
             return {"processed": 0, "succeeded": 0, "failed": 0}
+        max_entries = max(1, min(max_entries, 100))
         now_ts = int(self._now())
         pending = self.store.list_outbox_pending(now_ts=now_ts, limit=max_entries)
         succeeded = 0
