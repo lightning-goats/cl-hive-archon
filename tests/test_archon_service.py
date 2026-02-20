@@ -10,16 +10,25 @@ from modules.archon_service import ArchonService, ArchonStore
 
 
 class _MockRpc:
-    """Minimal RPC mock that provides signmessage and getinfo."""
+    """Minimal RPC mock that provides signmessage, getinfo, and listfunds."""
 
-    def __init__(self, pubkey: str = "02" + "ab" * 32):
+    def __init__(self, pubkey: str = "02" + "ab" * 32, local_balance_msat: int = 500_000_000_000):
         self._pubkey = pubkey
+        self._local_balance_msat = local_balance_msat
 
     def getinfo(self):
         return {"id": self._pubkey}
 
     def signmessage(self, message: str):
         return {"zbase": "mock_sig_" + message[:16]}
+
+    def listfunds(self):
+        return {
+            "channels": [
+                {"our_amount_msat": self._local_balance_msat},
+            ],
+            "outputs": [],
+        }
 
 
 def _make_service(tmp_path, **kwargs):
@@ -374,3 +383,142 @@ def test_upgrade_bond_sats_type_coercion(tmp_path):
     result = service.upgrade(target_tier="governance", bond_sats="not_a_number")
     assert "error" in result
     assert "bond" in result["error"].lower() or "insufficient" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Audit action-item tests
+# ---------------------------------------------------------------------------
+
+
+def test_bond_verification_fails_insufficient_balance(tmp_path):
+    """Bond verification should reject upgrade when channel balance is too low."""
+    low_balance_rpc = _MockRpc(local_balance_msat=10_000_000)  # 10,000 sats
+    service = _make_service(tmp_path, rpc=low_balance_rpc)
+    service.provision()
+
+    result = service.upgrade(target_tier="governance", bond_sats=100_000)
+    assert "error" in result
+    assert "bond verification failed" in result["error"]
+    assert result.get("local_balance_sats", 0) < 100_000
+
+
+def test_voter_id_pinned_to_node_pubkey(tmp_path):
+    """Voter ID must be the node pubkey, not the DID, to prevent sybil voting."""
+    expected_pubkey = "02" + "ab" * 32
+    service = _make_service(tmp_path)
+    service.provision()
+    service.upgrade(target_tier="governance", bond_sats=100_000)
+
+    create = service.poll_create(
+        poll_type="config",
+        title="Test voter pinning",
+        options=["yes", "no"],
+        deadline=int(time.time()) + 3600,
+        metadata={},
+    )
+    assert create["ok"] is True
+
+    poll_id = create["poll_id"]
+    vote_result = service.vote(poll_id=poll_id, choice="yes", reason="test")
+    assert vote_result["ok"] is True
+    assert vote_result["voter_id"] == expected_pubkey
+
+    # Also verify via my_votes() that the voter_id is the pubkey
+    my = service.my_votes(limit=10)
+    assert my["ok"] is True
+    assert my["voter_id"] == expected_pubkey
+    assert my["count"] == 1
+    assert my["votes"][0]["voter_id"] == expected_pubkey
+
+    # Confirm voter_id is NOT the DID
+    identity = service.store.get_identity()
+    assert identity is not None
+    did = identity.get("did", "")
+    assert did.startswith("did:cid:")
+    assert vote_result["voter_id"] != did
+
+
+def test_outbox_queuing_and_processing(tmp_path):
+    """Outbox should process pending entries and return correct structure."""
+    db_path = str(tmp_path / "archon_outbox.db")
+    store = ArchonStore(db_path=db_path)
+    service = ArchonService(
+        store=store,
+        rpc=_MockRpc(),
+        network_enabled=True,
+        gateway_url="http://localhost:9999",
+    )
+
+    result = service.provision()
+    assert result["ok"] is True
+    # Provision falls back to local when the gateway at :9999 is unreachable,
+    # and queues a retry entry in the outbox.
+    assert result["source"] == "local-fallback"
+
+    # process_outbox should return the expected structure
+    outbox_result = service.process_outbox()
+    assert "processed" in outbox_result
+    assert "succeeded" in outbox_result
+    assert "failed" in outbox_result
+    # The queued provision retry should be attempted (and fail against :9999)
+    assert outbox_result["processed"] >= 1
+    assert outbox_result["failed"] >= 1
+
+
+def test_outbox_store_methods(tmp_path):
+    """Outbox store methods: add, list, mark_success, mark_failed, prune."""
+    db_path = str(tmp_path / "archon_store.db")
+    store = ArchonStore(db_path=db_path)
+    store.initialize()
+
+    now = int(time.time())
+
+    # add_outbox_entry
+    store.add_outbox_entry(
+        entry_id="entry-001",
+        operation="provision",
+        payload_json='{"node_pubkey":"02aabb"}',
+        now_ts=now,
+        max_retries=3,
+    )
+    store.add_outbox_entry(
+        entry_id="entry-002",
+        operation="create_poll",
+        payload_json='{"poll_type":"config"}',
+        now_ts=now,
+        max_retries=5,
+    )
+
+    # list_outbox_pending - both entries should be pending
+    pending = store.list_outbox_pending(now_ts=now + 1, limit=50)
+    assert len(pending) == 2
+    entry_ids = {e["entry_id"] for e in pending}
+    assert "entry-001" in entry_ids
+    assert "entry-002" in entry_ids
+
+    # mark_outbox_success
+    store.mark_outbox_success("entry-001")
+    pending_after = store.list_outbox_pending(now_ts=now + 1, limit=50)
+    assert len(pending_after) == 1
+    assert pending_after[0]["entry_id"] == "entry-002"
+
+    # mark_outbox_failed - retry_count increments, next_retry_at set
+    store.mark_outbox_failed("entry-002", error="connection refused", next_retry_at=now + 120)
+    # Should not appear in pending if now < next_retry_at
+    pending_immediate = store.list_outbox_pending(now_ts=now + 1, limit=50)
+    assert len(pending_immediate) == 0
+    # But should appear once next_retry_at is reached
+    pending_later = store.list_outbox_pending(now_ts=now + 121, limit=50)
+    assert len(pending_later) == 1
+    assert pending_later[0]["retry_count"] == 1
+    assert pending_later[0]["last_error"] == "connection refused"
+
+    # Exhaust retries (max_retries=5, already at 1)
+    for i in range(4):
+        store.mark_outbox_failed("entry-002", error=f"fail {i+2}", next_retry_at=now + 200 + i)
+    exhausted = store.list_outbox_pending(now_ts=now + 9999, limit=50)
+    assert len(exhausted) == 0  # entry-002 should be exhausted
+
+    # prune_outbox - removes completed/exhausted entries older than cutoff
+    pruned = store.prune_outbox(before_ts=now + 10000)
+    assert pruned == 2  # entry-001 (completed) + entry-002 (exhausted)

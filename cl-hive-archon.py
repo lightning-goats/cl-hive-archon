@@ -205,6 +205,12 @@ def hive_my_votes(plugin: Plugin, limit: int = 50) -> Dict[str, Any]:
     return _require_service().my_votes(limit=_parse_int(limit, 50))
 
 
+@plugin.method("hive-archon-sign-message")
+def hive_archon_sign_message(plugin: Plugin, message: str) -> Dict[str, Any]:
+    del plugin
+    return _require_service().sign_message(message=message)
+
+
 @plugin.method("hive-archon-prune")
 def hive_archon_prune(plugin: Plugin, retention_days: int = 90) -> Dict[str, Any]:
     del plugin
