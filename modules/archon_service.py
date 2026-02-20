@@ -547,14 +547,13 @@ class ArchonGatewayClient:
         for ip_str in ips:
             try:
                 addr = ipaddress.ip_address(ip_str)
-                for network in _BLOCKED_NETWORKS:
-                    if addr in network:
-                        # Allow localhost explicitly if needed, but blocked networks usually cover it
-                        if addr.is_loopback:
-                            continue
-                        raise ValueError(f"blocked IP: {addr}")
             except ValueError:
                 continue
+            if addr.is_loopback:
+                continue
+            for network in _BLOCKED_NETWORKS:
+                if addr in network:
+                    raise ValueError(f"blocked IP: {addr}")
 
     def _request(self, method: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         # Perform DNS check before request to mitigate rebinding (TOCTOU remains but window is small)

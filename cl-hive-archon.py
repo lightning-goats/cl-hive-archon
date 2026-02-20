@@ -217,5 +217,11 @@ def hive_archon_prune(plugin: Plugin, retention_days: int = 90) -> Dict[str, Any
     return _require_service().prune(retention_days=_parse_int(retention_days, 90))
 
 
+@plugin.method("hive-archon-process-outbox")
+def hive_archon_process_outbox(plugin: Plugin, max_entries: int = 10) -> Dict[str, Any]:
+    del plugin
+    return _require_service().process_outbox(max_entries=_parse_int(max_entries, 10))
+
+
 if __name__ == "__main__":
     plugin.run()
