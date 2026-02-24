@@ -5,7 +5,6 @@ import os
 import sys
 import time
 from unittest.mock import patch, MagicMock
-from urllib.error import URLError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -223,7 +222,7 @@ def test_bind_rejects_foreign_did(tmp_path):
     service = _make_service(tmp_path)
     service.provision()
 
-    foreign_did = "did:cid:b" + "abcdefgh" * 6
+    foreign_did = "did:cid:b" + "abcdefgh" * 7
     res = service.bind_nostr("ab" * 32, did=foreign_did)
     assert "error" in res
     assert "not owned" in res["error"]
@@ -235,7 +234,7 @@ def test_bind_rejects_foreign_did(tmp_path):
 
 def test_bind_rejects_explicit_did_without_identity(tmp_path):
     service = _make_service(tmp_path)
-    unowned_did = "did:cid:b" + "ijklmnop" * 6
+    unowned_did = "did:cid:b" + "ijklmnop" * 7
 
     res = service.bind_nostr("ab" * 32, did=unowned_did)
     assert "error" in res
@@ -670,24 +669,43 @@ def _mock_urlopen_response(data: dict, status: int = 200):
 @patch("modules.archon_service.socket.getaddrinfo")
 @patch("modules.archon_service.urllib.request.urlopen")
 def test_gateway_client_provision_success(mock_urlopen, mock_dns):
-    """provision_identity should POST to /api/v1/did and return a DID."""
+    """provision_identity should POST to /api/v1/did/generate and handle bare string response."""
     mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
-    mock_urlopen.return_value = _mock_urlopen_response({"did": "did:cid:btest123"})
+    # Gatekeeper returns a bare DID string, not {"did": "..."}
+    bare_did = "did:cid:btest1234567890abcdef"
+    body = json.dumps(bare_did).encode("utf-8")
+    mock_response = MagicMock()
+    mock_response.read.return_value = body
+    mock_response.__enter__ = lambda s: s
+    mock_response.__exit__ = MagicMock(return_value=False)
+    mock_urlopen.return_value = mock_response
 
     client = ArchonGatewayClient("https://archon.example.com")
     result = client.provision_identity("02" + "ab" * 32, "my-label")
-    assert result == "did:cid:btest123"
+    assert result == bare_did
 
-    # Verify correct API path and archon Operation format
+    # Verify correct API path (did/generate, not did)
     call_args = mock_urlopen.call_args
     req = call_args[0][0]
-    assert "/api/v1/did" in req.full_url
+    assert "/api/v1/did/generate" in req.full_url
     body = json.loads(req.data)
     assert body["type"] == "create"
     assert "created" in body
     assert body["registration"]["version"] == 1
     assert body["registration"]["type"] == "agent"
     assert body["data"]["node_pubkey"] == "02" + "ab" * 32
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+@patch("modules.archon_service.urllib.request.urlopen")
+def test_gateway_client_provision_handles_dict_response(mock_urlopen, mock_dns):
+    """provision_identity should also handle {"did": "..."} response format."""
+    mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
+    mock_urlopen.return_value = _mock_urlopen_response({"did": "did:cid:btest1234567890abcdef"})
+
+    client = ArchonGatewayClient("https://archon.example.com")
+    result = client.provision_identity("02" + "ab" * 32, "label")
+    assert result == "did:cid:btest1234567890abcdef"
 
 
 @patch("modules.archon_service.socket.getaddrinfo")
@@ -705,7 +723,7 @@ def test_gateway_client_provision_bad_response(mock_urlopen, mock_dns):
 @patch("modules.archon_service.socket.getaddrinfo")
 @patch("modules.archon_service.urllib.request.urlopen")
 def test_gateway_client_create_poll_success(mock_urlopen, mock_dns):
-    """create_poll should POST to /api/v1/polls with PollConfig v2 format."""
+    """create_poll should POST to /api/v1/polls with PollConfig v2 format and registry."""
     mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
     mock_urlopen.return_value = _mock_urlopen_response({"did": "did:cid:bpoll123"})
 
@@ -722,6 +740,8 @@ def test_gateway_client_create_poll_success(mock_urlopen, mock_dns):
     assert body["poll"]["name"] == "Test Poll"
     assert body["poll"]["options"] == ["yes", "no"]
     assert "T" in body["poll"]["deadline"]  # ISO 8601 format
+    # VaultOptions must include registry
+    assert body["options"]["registry"] == "hyperswarm"
 
 
 @patch("modules.archon_service.socket.getaddrinfo")
@@ -817,3 +837,71 @@ def test_gateway_client_no_auth_header_when_empty(mock_urlopen, mock_dns):
     call_args = mock_urlopen.call_args
     req = call_args[0][0]
     assert req.get_header("Authorization") is None
+
+
+# ---------------------------------------------------------------------------
+# Spoiled ballot tests
+# ---------------------------------------------------------------------------
+
+
+def test_spoiled_ballot_vote(tmp_path):
+    """Voting 'spoil' should be accepted as a spoiled ballot."""
+    service = _make_service(tmp_path)
+    service.provision()
+    service.upgrade(target_tier="governance", bond_sats=100_000)
+
+    create = service.poll_create(
+        poll_type="config",
+        title="Test spoil",
+        options=["yes", "no"],
+        deadline=int(time.time()) + 3600,
+    )
+    assert create["ok"] is True
+
+    vote = service.vote(create["poll_id"], "spoil", reason="abstaining")
+    assert vote["ok"] is True
+    assert vote["choice"] == "spoil"
+
+    status = service.poll_status(create["poll_id"])
+    assert status["ok"] is True
+    assert status["tally"]["spoil"] == 1
+    assert status["tally"]["yes"] == 0
+    assert status["tally"]["no"] == 0
+
+
+def test_poll_status_includes_spoil_in_tally(tmp_path):
+    """poll_status tally should always include the 'spoil' key."""
+    service = _make_service(tmp_path)
+    service.provision()
+    service.upgrade(target_tier="governance", bond_sats=100_000)
+
+    create = service.poll_create(
+        poll_type="config",
+        title="Tally check",
+        options=["yes", "no"],
+        deadline=int(time.time()) + 3600,
+    )
+    assert create["ok"] is True
+
+    status = service.poll_status(create["poll_id"])
+    assert "spoil" in status["tally"]
+    assert status["tally"]["spoil"] == 0
+
+
+# ---------------------------------------------------------------------------
+# DID validation min-length tests
+# ---------------------------------------------------------------------------
+
+
+def test_did_validation_rejects_short_dids(tmp_path):
+    """DID validation should reject DIDs shorter than 60 chars."""
+    from modules.archon_service import _is_valid_did
+
+    short = "did:cid:b" + "abcdefg"  # 16 chars, too short
+    assert _is_valid_did(short) is False
+
+    medium = "did:cid:b" + "a" * 40  # 49 chars, still too short
+    assert _is_valid_did(medium) is False
+
+    valid_len = "did:cid:b" + "a" * 51  # 60 chars exactly
+    assert _is_valid_did(valid_len) is True

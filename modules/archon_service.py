@@ -44,7 +44,7 @@ def _is_valid_did(value: str) -> bool:
     if not isinstance(value, str):
         return False
     did = value.strip()
-    if len(did) < 12 or len(did) > 128:
+    if len(did) < 60 or len(did) > 128:
         return False
     if not did.startswith("did:cid:"):
         return False
@@ -570,7 +570,7 @@ class ArchonGatewayClient:
                 if addr in network:
                     raise ValueError(f"blocked IP: {addr}")
 
-    def _request(self, method: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _request(self, method: str, path: str, payload: Dict[str, Any]) -> Any:
         # Perform DNS check before request to mitigate rebinding (TOCTOU remains but window is small)
         # Skip for literal localhost hostnames (already validated at config time by _is_valid_gateway_url)
         parsed = urlparse(self.base_url)
@@ -597,10 +597,11 @@ class ArchonGatewayClient:
             return json.loads(raw) if raw else {}
 
     def provision_identity(self, node_pubkey: str, label: str) -> Optional[str]:
-        """Register a DID via the archon gatekeeper POST /api/v1/did.
+        """Generate a DID via the archon gatekeeper POST /api/v1/did/generate.
 
-        Sends a create operation with the node pubkey and label.
-        The gateway is responsible for full DID document generation.
+        Uses the generate endpoint which returns a CID without requiring
+        proof verification (unlike POST /api/v1/did which requires
+        publicJwk + proof that CLN HSM cannot produce in JWK/JWS format).
         """
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         payload = {
@@ -616,8 +617,9 @@ class ArchonGatewayClient:
                 "label": label,
             },
         }
-        data = self._request("POST", "/api/v1/did", payload)
-        did = data.get("did")
+        data = self._request("POST", "/api/v1/did/generate", payload)
+        # Gatekeeper returns a bare DID string, not {"did": "..."}
+        did = data if isinstance(data, str) else (data.get("did") if isinstance(data, dict) else None)
         if isinstance(did, str) and did.startswith("did:cid:"):
             return did
         return None
@@ -649,9 +651,7 @@ class ArchonGatewayClient:
         payload = {
             "poll": poll_config,
             "options": {
-                "creator": creator,
-                "poll_type": poll_type,
-                "metadata": metadata,
+                "registry": "hyperswarm",
             },
         }
         data = self._request("POST", "/api/v1/polls", payload)
@@ -685,6 +685,7 @@ class ArchonService:
     """Phase 6B service API used by cl-hive-archon RPC methods."""
 
     VALID_GOVERNANCE_TIERS = {"basic", "governance"}
+    SPOIL_CHOICE = "spoil"
 
     MAX_LABEL_LEN = 120
     MAX_POLL_TYPE_LEN = 32
@@ -1254,7 +1255,10 @@ class ArchonService:
             options = []
 
         votes = self.store.list_votes_for_poll(poll_id)
-        tally: Dict[str, int] = {opt: 0 for opt in options if isinstance(opt, str)}
+        tally: Dict[str, int] = {self.SPOIL_CHOICE: 0}
+        for opt in options:
+            if isinstance(opt, str):
+                tally[opt] = 0
         for vote in votes:
             choice = vote.get("choice")
             if isinstance(choice, str) and choice in tally:
@@ -1327,8 +1331,9 @@ class ArchonService:
             options = json.loads(poll.get("options_json") or "[]")
         except (json.JSONDecodeError, TypeError):
             options = []
-        if choice not in options:
-            return {"error": "invalid choice", "valid_choices": options}
+        is_spoil = choice == self.SPOIL_CHOICE
+        if not is_spoil and choice not in options:
+            return {"error": "invalid choice", "valid_choices": options + [self.SPOIL_CHOICE]}
 
         voter_id = self._voter_id()
         voted_at = self._now()
@@ -1369,7 +1374,7 @@ class ArchonService:
         if self.network_enabled and self._gateway_client and remote_poll_id:
             # Convert string choice to archon vote index (1-based; 0 = spoil)
             vote_index = 0
-            if choice in options:
+            if not is_spoil and choice in options:
                 vote_index = options.index(choice) + 1
             try:
                 remote_vote_sent = self._gateway_client.submit_vote(

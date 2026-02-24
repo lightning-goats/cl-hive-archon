@@ -26,8 +26,8 @@ When archon is absent, cl-hive operates normally using local HSM signing.
 - **DID Identity** — Each node gets a `did:cid:` identifier (CIDv1 base32lower) derived from its pubkey. Used as a stable identity across key rotations and DID reprovisioning.
 - **Nostr & CLN Bindings** — Cryptographically attest links between a DID and Nostr pubkeys or CLN node pubkeys. Attestations are signed via CLN HSM.
 - **Proof-of-Stake Governance** — Nodes upgrade to governance tier by proving channel balance >= bond threshold (default 50,000 sats). Prevents sybil voting.
-- **Poll-Based Elections** — Create polls with 2-10 options and a deadline. One vote per voter per poll, enforced at the database level. Votes are canonically signed.
-- **Optional Gateway Sync** — Polls and votes can optionally sync to an Archon gatekeeper/keymaster via the standard `did:cid` API (`/api/v1/did`, `/api/v1/polls`). Disabled by default (dark launch). Failed syncs queue to an outbox with exponential backoff retry.
+- **Poll-Based Elections** — Create polls with 2-10 options and a deadline. One vote per voter per poll, enforced at the database level. Votes are canonically signed. Spoiled ballots supported via `choice=spoil`.
+- **Optional Gateway Sync** — Polls and votes can optionally sync to an Archon gatekeeper/keymaster via the standard `did:cid` API (`/api/v1/did/generate`, `/api/v1/polls`). Disabled by default (dark launch). Failed syncs queue to an outbox with exponential backoff retry.
 
 ## Requirements
 
@@ -84,6 +84,9 @@ lightning-cli hive-poll-create poll_type=expansion title="Open channel to ACINQ?
 # Vote
 lightning-cli hive-vote poll_id=<id> choice=yes reason="Good connectivity"
 
+# Spoiled ballot (abstain without choosing an option)
+lightning-cli hive-vote poll_id=<id> choice=spoil reason="No opinion"
+
 # View your votes
 lightning-cli hive-my-votes
 ```
@@ -123,7 +126,7 @@ lightning-cli hive-my-votes
 ## Development
 
 ```bash
-python3 -m pytest tests/ -v    # 43 tests
+python3 -m pytest tests/ -v    # 47 tests
 ```
 
 ## License
