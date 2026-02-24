@@ -44,6 +44,12 @@ plugin.add_option(
     description="Minimum bond (sats) required to upgrade to governance tier",
 )
 
+plugin.add_option(
+    name="hive-archon-gateway-auth-token",
+    default="",
+    description="Bearer token for Archon gateway API authentication",
+)
+
 
 def _parse_bool(value: Any) -> bool:
     if isinstance(value, bool):
@@ -85,6 +91,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     gateway_url = str(options.get("hive-archon-gateway") or "").strip()
     network_enabled = _parse_bool(options.get("hive-archon-network-enabled"))
     min_bond = max(1, _parse_int(options.get("hive-archon-governance-min-bond"), 50_000))
+    gateway_auth_token = str(options.get("hive-archon-gateway-auth-token") or "").strip()
 
     store = ArchonStore(db_path=db_path, logger=_logger)
 
@@ -96,6 +103,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         gateway_url=gateway_url,
         network_enabled=network_enabled,
         min_governance_bond_sats=min_bond,
+        gateway_auth_token=gateway_auth_token,
     )
 
     # Warn if cl-hive-comms is not detected (unsupported configuration)

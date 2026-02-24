@@ -23,11 +23,11 @@ When archon is absent, cl-hive operates normally using local HSM signing.
 
 ## Features
 
-- **DID Identity** — Each node gets a `did:cid:` identifier derived from its pubkey. Used as a stable identity across key rotations and DID reprovisioning.
+- **DID Identity** — Each node gets a `did:cid:` identifier (CIDv1 base32lower) derived from its pubkey. Used as a stable identity across key rotations and DID reprovisioning.
 - **Nostr & CLN Bindings** — Cryptographically attest links between a DID and Nostr pubkeys or CLN node pubkeys. Attestations are signed via CLN HSM.
 - **Proof-of-Stake Governance** — Nodes upgrade to governance tier by proving channel balance >= bond threshold (default 50,000 sats). Prevents sybil voting.
 - **Poll-Based Elections** — Create polls with 2-10 options and a deadline. One vote per voter per poll, enforced at the database level. Votes are canonically signed.
-- **Optional Gateway Sync** — Polls and votes can optionally sync to an Archon gateway for cross-fleet visibility. Disabled by default (dark launch). Failed syncs queue to an outbox with exponential backoff retry.
+- **Optional Gateway Sync** — Polls and votes can optionally sync to an Archon gatekeeper/keymaster via the standard `did:cid` API (`/api/v1/did`, `/api/v1/polls`). Disabled by default (dark launch). Failed syncs queue to an outbox with exponential backoff retry.
 
 ## Requirements
 
@@ -57,9 +57,10 @@ echo "plugin=/path/to/cl-hive-archon/cl-hive-archon.py" >> ~/.lightning/config
 | Option | Default | Description |
 |--------|---------|-------------|
 | `hive-archon-db-path` | `~/.lightning/cl_hive_archon.db` | SQLite database path |
-| `hive-archon-gateway` | `https://archon.technology` | Gateway URL for optional remote sync |
+| `hive-archon-gateway` | `https://archon.technology` | Archon gatekeeper/keymaster base URL for optional remote sync |
 | `hive-archon-network-enabled` | `false` | Enable gateway HTTP calls (safe to leave off) |
 | `hive-archon-governance-min-bond` | `50000` | Minimum sats in channels to unlock governance tier |
+| `hive-archon-gateway-auth-token` | `""` | Bearer token for Archon gateway API authentication |
 
 ## Quick Start
 
@@ -109,19 +110,20 @@ lightning-cli hive-my-votes
 - **All signing via CLN HSM** — no crypto libraries imported, no private keys in memory
 - **Voter identity pinned to node pubkey** — immutable across DID reprovisioning, prevents sybil voting
 - **DB file permissions 0o600** — owner read/write only
-- **SSRF protection** — gateway calls resolve DNS first, block private/loopback IP ranges
+- **SSRF protection** — gateway calls resolve DNS first, block private/loopback IP ranges; DNS resolution failures are fail-closed
 - **Fail-closed** — network errors queue to outbox, never corrupt local state
+- **Gateway auth** — optional Bearer token authentication for Archon gateway API calls
 - **Input validation** — strict bounds on all fields (pubkey format, option count, metadata size)
 - **SQLite WAL mode** with thread-local connections for concurrent access
 
 ## Database
 
-6 tables: `archon_identity`, `archon_bindings`, `archon_polls`, `archon_votes`, `archon_outbox`, plus `nostr_state` for KV storage. Bounded at 5,000 polls and 50,000 votes with automatic pruning.
+5 tables: `archon_identity`, `archon_bindings`, `archon_polls`, `archon_votes`, `archon_outbox`. Bounded at 5,000 polls and 50,000 votes with automatic pruning.
 
 ## Development
 
 ```bash
-python3 -m pytest tests/ -v    # 42 tests
+python3 -m pytest tests/ -v    # 43 tests
 ```
 
 ## License

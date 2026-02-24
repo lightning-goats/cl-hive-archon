@@ -1,12 +1,15 @@
 """Unit tests for cl-hive-archon core service."""
 
+import json
 import os
 import sys
 import time
+from unittest.mock import patch, MagicMock
+from urllib.error import URLError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.archon_service import ArchonService, ArchonStore
+from modules.archon_service import ArchonGatewayClient, ArchonService, ArchonStore
 
 
 class _MockRpc:
@@ -162,7 +165,8 @@ def test_vote_rejects_too_long_reason(tmp_path):
 
 
 def test_expired_poll_auto_completes(tmp_path):
-    service = _make_service(tmp_path)
+    current_time = [time.time()]
+    service = _make_service(tmp_path, time_fn=lambda: current_time[0])
     service.provision()
     service.upgrade(target_tier="governance", bond_sats=100_000)
 
@@ -170,12 +174,13 @@ def test_expired_poll_auto_completes(tmp_path):
         poll_type="ban",
         title="Ban peer A",
         options=["ban", "no-ban"],
-        deadline=int(time.time()) + 1,
+        deadline=int(current_time[0]) + 10,
         metadata={},
     )
     assert create["ok"] is True
 
-    time.sleep(1.1)
+    # Advance time past deadline
+    current_time[0] += 11
     status = service.poll_status(create["poll_id"])
     assert status["ok"] is True
     assert status["poll"]["status"] == "completed"
@@ -218,7 +223,7 @@ def test_bind_rejects_foreign_did(tmp_path):
     service = _make_service(tmp_path)
     service.provision()
 
-    foreign_did = "did:cid:" + "ff" * 24
+    foreign_did = "did:cid:b" + "abcdefgh" * 6
     res = service.bind_nostr("ab" * 32, did=foreign_did)
     assert "error" in res
     assert "not owned" in res["error"]
@@ -230,7 +235,7 @@ def test_bind_rejects_foreign_did(tmp_path):
 
 def test_bind_rejects_explicit_did_without_identity(tmp_path):
     service = _make_service(tmp_path)
-    unowned_did = "did:cid:" + "aa" * 24
+    unowned_did = "did:cid:b" + "ijklmnop" * 6
 
     res = service.bind_nostr("ab" * 32, did=unowned_did)
     assert "error" in res
@@ -522,3 +527,293 @@ def test_outbox_store_methods(tmp_path):
     # prune_outbox - removes completed/exhausted entries older than cutoff
     pruned = store.prune_outbox(before_ts=now + 10000)
     assert pruned == 2  # entry-001 (completed) + entry-002 (exhausted)
+
+
+# ---------------------------------------------------------------------------
+# sign_message tests
+# ---------------------------------------------------------------------------
+
+
+def test_sign_message_success(tmp_path):
+    """sign_message should return ok and a signature for valid input."""
+    service = _make_service(tmp_path)
+    result = service.sign_message("hello world")
+    assert result["ok"] is True
+    assert result["signature"].startswith("mock_sig_")
+
+
+def test_sign_message_rejects_oversized(tmp_path):
+    """sign_message should reject messages exceeding MAX_SIGN_MESSAGE_LEN."""
+    service = _make_service(tmp_path)
+    big = "x" * (service.MAX_SIGN_MESSAGE_LEN + 1)
+    result = service.sign_message(big)
+    assert "error" in result
+    assert "characters" in result["error"]
+
+
+def test_sign_message_handles_rpc_failure(tmp_path):
+    """sign_message should return a truncated error when RPC fails."""
+    class _FailRpc(_MockRpc):
+        def signmessage(self, message):
+            raise RuntimeError("HSM connection lost " + "x" * 300)
+
+    service = _make_service(tmp_path, rpc=_FailRpc())
+    result = service.sign_message("test")
+    assert "error" in result
+    assert len(result["error"]) <= 200
+
+
+# ---------------------------------------------------------------------------
+# Capacity limit tests
+# ---------------------------------------------------------------------------
+
+
+def test_poll_capacity_limit(tmp_path):
+    """poll_create should reject when MAX_TOTAL_POLLS is reached."""
+    current_time = [time.time()]
+    service = _make_service(tmp_path, time_fn=lambda: current_time[0])
+    service.provision()
+    service.upgrade(target_tier="governance", bond_sats=100_000)
+
+    # Patch MAX_TOTAL_POLLS to a small number for testing
+    original = service.MAX_TOTAL_POLLS
+    service.MAX_TOTAL_POLLS = 3
+    try:
+        for i in range(3):
+            current_time[0] += 1
+            result = service.poll_create(
+                poll_type="config", title=f"Poll {i}",
+                options=["yes", "no"],
+                deadline=int(current_time[0]) + 36000,
+            )
+            assert result["ok"] is True
+
+        current_time[0] += 1
+        over = service.poll_create(
+            poll_type="config", title="Over limit",
+            options=["yes", "no"],
+            deadline=int(current_time[0]) + 36000,
+        )
+        assert "error" in over
+        assert "capacity" in over["error"]
+    finally:
+        service.MAX_TOTAL_POLLS = original
+
+
+def test_vote_capacity_limit(tmp_path):
+    """vote should reject when MAX_TOTAL_VOTES is reached."""
+    current_time = [time.time()]
+    service = _make_service(tmp_path, time_fn=lambda: current_time[0])
+    service.provision()
+    service.upgrade(target_tier="governance", bond_sats=100_000)
+
+    # Patch MAX_TOTAL_VOTES to a small number for testing
+    original = service.MAX_TOTAL_VOTES
+    service.MAX_TOTAL_VOTES = 1
+    try:
+        current_time[0] += 1
+        p1 = service.poll_create(
+            poll_type="config", title="Poll A",
+            options=["yes", "no"],
+            deadline=int(current_time[0]) + 36000,
+        )
+        assert p1["ok"] is True
+
+        current_time[0] += 1
+        v1 = service.vote(p1["poll_id"], "yes")
+        assert v1["ok"] is True
+
+        current_time[0] += 1
+        p2 = service.poll_create(
+            poll_type="config", title="Poll B",
+            options=["yes", "no"],
+            deadline=int(current_time[0]) + 36000,
+        )
+        assert p2["ok"] is True
+
+        current_time[0] += 1
+        v2 = service.vote(p2["poll_id"], "no")
+        assert "error" in v2
+        assert "capacity" in v2["error"]
+    finally:
+        service.MAX_TOTAL_VOTES = original
+
+
+# ---------------------------------------------------------------------------
+# my_votes edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_my_votes_rejects_bad_limits(tmp_path):
+    """my_votes should reject zero and negative limits."""
+    service = _make_service(tmp_path)
+    assert "error" in service.my_votes(limit=0)
+    assert "error" in service.my_votes(limit=-1)
+
+
+# ---------------------------------------------------------------------------
+# ArchonGatewayClient tests
+# ---------------------------------------------------------------------------
+
+
+def _mock_urlopen_response(data: dict, status: int = 200):
+    """Create a mock context manager for urllib.request.urlopen."""
+    body = json.dumps(data).encode("utf-8")
+    mock_response = MagicMock()
+    mock_response.read.return_value = body
+    mock_response.status = status
+    mock_response.__enter__ = lambda s: s
+    mock_response.__exit__ = MagicMock(return_value=False)
+    return mock_response
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+@patch("modules.archon_service.urllib.request.urlopen")
+def test_gateway_client_provision_success(mock_urlopen, mock_dns):
+    """provision_identity should POST to /api/v1/did and return a DID."""
+    mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
+    mock_urlopen.return_value = _mock_urlopen_response({"did": "did:cid:btest123"})
+
+    client = ArchonGatewayClient("https://archon.example.com")
+    result = client.provision_identity("02" + "ab" * 32, "my-label")
+    assert result == "did:cid:btest123"
+
+    # Verify correct API path and archon Operation format
+    call_args = mock_urlopen.call_args
+    req = call_args[0][0]
+    assert "/api/v1/did" in req.full_url
+    body = json.loads(req.data)
+    assert body["type"] == "create"
+    assert "created" in body
+    assert body["registration"]["version"] == 1
+    assert body["registration"]["type"] == "agent"
+    assert body["data"]["node_pubkey"] == "02" + "ab" * 32
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+@patch("modules.archon_service.urllib.request.urlopen")
+def test_gateway_client_provision_bad_response(mock_urlopen, mock_dns):
+    """provision_identity should return None when response has no valid DID."""
+    mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
+    mock_urlopen.return_value = _mock_urlopen_response({"error": "bad"})
+
+    client = ArchonGatewayClient("https://archon.example.com")
+    result = client.provision_identity("02" + "ab" * 32, "label")
+    assert result is None
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+@patch("modules.archon_service.urllib.request.urlopen")
+def test_gateway_client_create_poll_success(mock_urlopen, mock_dns):
+    """create_poll should POST to /api/v1/polls with PollConfig v2 format."""
+    mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
+    mock_urlopen.return_value = _mock_urlopen_response({"did": "did:cid:bpoll123"})
+
+    client = ArchonGatewayClient("https://archon.example.com")
+    result = client.create_poll("config", "Test Poll", ["yes", "no"], 1771700000, {"desc": "test"}, "creator-1")
+    assert result == "did:cid:bpoll123"
+
+    # Verify correct API path and PollConfig format
+    call_args = mock_urlopen.call_args
+    req = call_args[0][0]
+    assert "/api/v1/polls" in req.full_url
+    body = json.loads(req.data)
+    assert body["poll"]["version"] == 2
+    assert body["poll"]["name"] == "Test Poll"
+    assert body["poll"]["options"] == ["yes", "no"]
+    assert "T" in body["poll"]["deadline"]  # ISO 8601 format
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+@patch("modules.archon_service.urllib.request.urlopen")
+def test_gateway_client_submit_vote_success(mock_urlopen, mock_dns):
+    """submit_vote should POST to /api/v1/polls/:id/vote with integer vote."""
+    mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
+    mock_urlopen.return_value = _mock_urlopen_response({"did": "did:cid:bballot1"})
+
+    client = ArchonGatewayClient("https://archon.example.com")
+    result = client.submit_vote("did:cid:bpoll1", vote_index=1, voter_id="voter-1")
+    assert result is True
+
+    # Verify correct API path and vote format
+    call_args = mock_urlopen.call_args
+    req = call_args[0][0]
+    assert "/api/v1/polls/" in req.full_url
+    assert req.full_url.endswith("/vote")
+    body = json.loads(req.data)
+    assert body["vote"] == 1
+    assert "choice" not in body  # Must be integer vote, not string choice
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+@patch("modules.archon_service.urllib.request.urlopen")
+def test_gateway_client_submit_vote_failure(mock_urlopen, mock_dns):
+    """submit_vote should return False when gateway returns no DID."""
+    mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
+    mock_urlopen.return_value = _mock_urlopen_response({"error": "not authorized"})
+
+    client = ArchonGatewayClient("https://archon.example.com")
+    result = client.submit_vote("did:cid:bpoll1", vote_index=1, voter_id="voter-1")
+    assert result is False
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+def test_gateway_client_blocks_private_ip(mock_dns):
+    """Gateway client should reject requests to private IPs."""
+    mock_dns.return_value = [(2, 1, 6, '', ('10.0.0.1', 0))]
+
+    client = ArchonGatewayClient("https://internal.example.com")
+    # _request returns {} on blocked IP, so provision returns None
+    result = client.provision_identity("02" + "ab" * 32, "label")
+    assert result is None
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+def test_gateway_client_blocks_loopback_dns(mock_dns):
+    """Gateway client should reject DNS names that resolve to loopback."""
+    mock_dns.return_value = [(2, 1, 6, '', ('127.0.0.1', 0))]
+
+    client = ArchonGatewayClient("https://evil.example.com")
+    result = client.provision_identity("02" + "ab" * 32, "label")
+    assert result is None
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+def test_gateway_client_rejects_dns_failure(mock_dns):
+    """Gateway client should reject requests when DNS resolution fails."""
+    mock_dns.side_effect = OSError("DNS failure")
+
+    client = ArchonGatewayClient("https://unreachable.example.com")
+    result = client.provision_identity("02" + "ab" * 32, "label")
+    assert result is None
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+@patch("modules.archon_service.urllib.request.urlopen")
+def test_gateway_client_sends_auth_header(mock_urlopen, mock_dns):
+    """Gateway client should send Authorization header when auth_token is set."""
+    mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
+    mock_urlopen.return_value = _mock_urlopen_response({"did": "did:cid:btest"})
+
+    client = ArchonGatewayClient("https://archon.example.com", auth_token="secret-token-123")
+    client.provision_identity("02" + "ab" * 32, "label")
+
+    # Verify the request was made with the auth header
+    call_args = mock_urlopen.call_args
+    req = call_args[0][0]
+    assert req.get_header("Authorization") == "Bearer secret-token-123"
+
+
+@patch("modules.archon_service.socket.getaddrinfo")
+@patch("modules.archon_service.urllib.request.urlopen")
+def test_gateway_client_no_auth_header_when_empty(mock_urlopen, mock_dns):
+    """Gateway client should not send Authorization header when auth_token is empty."""
+    mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
+    mock_urlopen.return_value = _mock_urlopen_response({"did": "did:cid:btest"})
+
+    client = ArchonGatewayClient("https://archon.example.com", auth_token="")
+    client.provision_identity("02" + "ab" * 32, "label")
+
+    call_args = mock_urlopen.call_args
+    req = call_args[0][0]
+    assert req.get_header("Authorization") is None

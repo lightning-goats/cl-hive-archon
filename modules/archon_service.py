@@ -51,7 +51,14 @@ def _is_valid_did(value: str) -> bool:
     suffix = did[8:]
     if not suffix:
         return False
-    return all(ch.isalnum() or ch in "-._:" for ch in suffix)
+    # CIDv1 base32lower multibase prefix is 'b'; remaining chars are base32 (a-z, 2-7)
+    if not suffix.startswith("b"):
+        return False
+    cid_body = suffix[1:]
+    if not cid_body:
+        return False
+    _BASE32_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz234567")
+    return all(ch in _BASE32_CHARS for ch in cid_body)
 
 
 _BLOCKED_NETWORKS = [
@@ -449,24 +456,21 @@ class ArchonStore:
         Returns the number of polls deleted.
         """
         conn = self._get_connection()
-        try:
-            with conn:
-                conn.execute(
-                    """
-                    DELETE FROM archon_votes WHERE poll_id IN (
-                        SELECT poll_id FROM archon_polls
-                        WHERE status = 'completed' AND deadline < ?
-                    )
-                    """,
-                    (before_ts,),
+        with conn:
+            conn.execute(
+                """
+                DELETE FROM archon_votes WHERE poll_id IN (
+                    SELECT poll_id FROM archon_polls
+                    WHERE status = 'completed' AND deadline < ?
                 )
-                cursor = conn.execute(
-                    "DELETE FROM archon_polls WHERE status = 'completed' AND deadline < ?",
-                    (before_ts,),
-                )
-                return cursor.rowcount
-        except Exception:
-            raise
+                """,
+                (before_ts,),
+            )
+            cursor = conn.execute(
+                "DELETE FROM archon_polls WHERE status = 'completed' AND deadline < ?",
+                (before_ts,),
+            )
+            return cursor.rowcount
 
     # ------------------------------------------------------------------
     # Outbox methods (reliable gateway sync)
@@ -544,9 +548,10 @@ class ArchonStore:
 class ArchonGatewayClient:
     """Small HTTP client for optional Archon gateway integration."""
 
-    def __init__(self, base_url: str, timeout_seconds: int = 10):
+    def __init__(self, base_url: str, timeout_seconds: int = 10, auth_token: str = ""):
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.auth_token = auth_token.strip()
 
     def _resolve_and_check(self, hostname: str) -> None:
         try:
@@ -554,15 +559,12 @@ class ArchonGatewayClient:
             info = socket.getaddrinfo(hostname, None)
             ips = [item[4][0] for item in info]
         except OSError:
-            # If resolution fails, let urllib handle it (or fail)
-            return
+            raise ValueError(f"DNS resolution failed for {hostname}")
 
         for ip_str in ips:
             try:
                 addr = ipaddress.ip_address(ip_str)
             except ValueError:
-                continue
-            if addr.is_loopback:
                 continue
             for network in _BLOCKED_NETWORKS:
                 if addr in network:
@@ -570,18 +572,23 @@ class ArchonGatewayClient:
 
     def _request(self, method: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         # Perform DNS check before request to mitigate rebinding (TOCTOU remains but window is small)
+        # Skip for literal localhost hostnames (already validated at config time by _is_valid_gateway_url)
         parsed = urlparse(self.base_url)
-        if parsed.hostname:
+        _LOCALHOST_LITERALS = ("localhost", "127.0.0.1", "::1")
+        if parsed.hostname and parsed.hostname not in _LOCALHOST_LITERALS:
             try:
                 self._resolve_and_check(parsed.hostname)
-            except ValueError as e:
-                return {}  # Fail silently or log? Returning empty dict is consistent with fail-closed here
+            except ValueError:
+                return {}
 
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
         req = urllib.request.Request(
             f"{self.base_url}{path}",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method=method,
         )
         ctx = ssl.create_default_context()
@@ -590,8 +597,26 @@ class ArchonGatewayClient:
             return json.loads(raw) if raw else {}
 
     def provision_identity(self, node_pubkey: str, label: str) -> Optional[str]:
-        payload = {"node_pubkey": node_pubkey, "label": label}
-        data = self._request("POST", "/v1/hive/provision", payload)
+        """Register a DID via the archon gatekeeper POST /api/v1/did.
+
+        Sends a create operation with the node pubkey and label.
+        The gateway is responsible for full DID document generation.
+        """
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        payload = {
+            "type": "create",
+            "created": now_iso,
+            "registration": {
+                "version": 1,
+                "type": "agent",
+                "registry": "hyperswarm",
+            },
+            "data": {
+                "node_pubkey": node_pubkey,
+                "label": label,
+            },
+        }
+        data = self._request("POST", "/api/v1/did", payload)
         did = data.get("did")
         if isinstance(did, str) and did.startswith("did:cid:"):
             return did
@@ -606,31 +631,54 @@ class ArchonGatewayClient:
         metadata: Dict[str, Any],
         creator: str,
     ) -> Optional[str]:
-        payload = {
-            "poll_type": poll_type,
-            "title": title,
+        """Create a poll via the archon keymaster POST /api/v1/polls.
+
+        Maps local poll fields to archon PollConfig (version 2).
+        """
+        deadline_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(deadline))
+        description = str(metadata.get("description", "")) if metadata else ""
+        if not description:
+            description = f"{poll_type}: {title}"
+        poll_config = {
+            "version": 2,
+            "name": title,
+            "description": description,
             "options": options,
-            "deadline": deadline,
-            "metadata": metadata,
-            "creator": creator,
+            "deadline": deadline_iso,
         }
-        data = self._request("POST", "/v1/hive/polls", payload)
-        poll_id = data.get("poll_id")
-        if isinstance(poll_id, str) and poll_id:
-            return poll_id
+        payload = {
+            "poll": poll_config,
+            "options": {
+                "creator": creator,
+                "poll_type": poll_type,
+                "metadata": metadata,
+            },
+        }
+        data = self._request("POST", "/api/v1/polls", payload)
+        poll_did = data.get("did")
+        if isinstance(poll_did, str) and poll_did:
+            return poll_did
         return None
 
-    def submit_vote(self, poll_id: str, voter_id: str, choice: str, reason: str) -> bool:
+    def submit_vote(
+        self,
+        poll_id: str,
+        vote_index: int,
+        voter_id: str = "",
+    ) -> bool:
+        """Submit a vote via the archon keymaster POST /api/v1/polls/:poll/vote.
+
+        Args:
+            poll_id: The remote poll DID.
+            vote_index: Integer vote (0=spoil, 1-N=option index).
+            voter_id: Local voter identifier (for logging; archon uses caller identity).
+        """
         from urllib.parse import quote as _url_quote
-        payload = {
-            "poll_id": poll_id,
-            "voter_id": voter_id,
-            "choice": choice,
-            "reason": reason,
-        }
         safe_poll_id = _url_quote(poll_id, safe="")
-        data = self._request("POST", f"/v1/hive/polls/{safe_poll_id}/votes", payload)
-        return bool(data.get("ok", False))
+        payload: Dict[str, Any] = {"vote": vote_index}
+        data = self._request("POST", f"/api/v1/polls/{safe_poll_id}/vote", payload)
+        # Archon returns {did: "..."} on success
+        return bool(data.get("did") or data.get("ok", False))
 
 
 class ArchonService:
@@ -655,6 +703,7 @@ class ArchonService:
         network_enabled: bool = False,
         min_governance_bond_sats: int = 50_000,
         time_fn: Callable[[], float] = time.time,
+        gateway_auth_token: str = "",
     ):
         self.store = store
         self.rpc = rpc
@@ -663,6 +712,7 @@ class ArchonService:
         self.network_enabled = bool(network_enabled)
         self.min_governance_bond_sats = max(1, int(min_governance_bond_sats))
         self._time_fn = time_fn
+        self._gateway_auth_token = gateway_auth_token.strip()
 
         if self.network_enabled and not self._is_valid_gateway_url(self.gateway_url):
             self._log("archon: invalid gateway URL; disabling network integration", "warn")
@@ -670,7 +720,8 @@ class ArchonService:
             self.gateway_url = ""
 
         self._gateway_client = (
-            ArchonGatewayClient(self.gateway_url) if self.network_enabled and self.gateway_url else None
+            ArchonGatewayClient(self.gateway_url, auth_token=self._gateway_auth_token)
+            if self.network_enabled and self.gateway_url else None
         )
         self.store.initialize()
 
@@ -746,12 +797,12 @@ class ArchonService:
     def sign_message(self, message: str) -> Dict[str, Any]:
         """Sign a message using the identity key (public wrapper)."""
         if not isinstance(message, str) or len(message) > self.MAX_SIGN_MESSAGE_LEN:
-            return {"error": f"message must be a string of at most {self.MAX_SIGN_MESSAGE_LEN} bytes"}
+            return {"error": f"message must be a string of at most {self.MAX_SIGN_MESSAGE_LEN} characters"}
         try:
             sig = self._sign_message(message, required=True)
             return {"ok": True, "signature": sig}
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": str(e)[:200]}
 
     def _resolve_did(self, did: str = "") -> str:
         if did:
@@ -1015,7 +1066,7 @@ class ArchonService:
             }
         except Exception as exc:
             self._log(f"archon: bond verification failed: {exc}", "warn")
-            return {"verified": False, "reason": str(exc)}
+            return {"verified": False, "reason": str(exc)[:200]}
 
     def upgrade(self, target_tier: str = "governance", bond_sats: int = 0) -> Dict[str, Any]:
         if target_tier not in self.VALID_GOVERNANCE_TIERS:
@@ -1316,20 +1367,22 @@ class ArchonService:
         remote_vote_sent = False
         remote_poll_id = str(poll.get("remote_poll_id") or "")
         if self.network_enabled and self._gateway_client and remote_poll_id:
+            # Convert string choice to archon vote index (1-based; 0 = spoil)
+            vote_index = 0
+            if choice in options:
+                vote_index = options.index(choice) + 1
             try:
                 remote_vote_sent = self._gateway_client.submit_vote(
                     poll_id=remote_poll_id,
+                    vote_index=vote_index,
                     voter_id=voter_id,
-                    choice=choice,
-                    reason=reason,
                 )
             except Exception as exc:
                 self._log(f"archon: remote vote submit failed (local vote preserved): {exc}", "warn")
                 self._queue_outbox("submit_vote", {
                     "remote_poll_id": remote_poll_id,
+                    "vote_index": vote_index,
                     "voter_id": voter_id,
-                    "choice": choice,
-                    "reason": reason,
                 })
 
         return {
@@ -1451,9 +1504,8 @@ class ArchonService:
         elif operation == "submit_vote":
             return self._gateway_client.submit_vote(
                 poll_id=payload.get("remote_poll_id", ""),
+                vote_index=int(payload.get("vote_index", 0)),
                 voter_id=payload.get("voter_id", ""),
-                choice=payload.get("choice", ""),
-                reason=payload.get("reason", ""),
             )
         else:
             self._log(f"archon: unknown outbox operation: {operation}", "warn")
