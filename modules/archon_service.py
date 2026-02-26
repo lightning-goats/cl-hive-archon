@@ -13,6 +13,7 @@ import ssl
 import threading
 import time
 import uuid
+import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
@@ -114,8 +115,8 @@ class ArchonStore:
         if conn is not None:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log(f"archon: db close error: {exc}", "debug")
             self._local.conn = None
 
     def initialize(self) -> None:
@@ -592,9 +593,16 @@ class ArchonGatewayClient:
             method=method,
         )
         ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=ctx) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=ctx) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                return json.loads(raw) if raw else {}
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+            self._log(f"archon: gateway request {method} {path} failed: {exc}", "warn")
+            return {}
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._log(f"archon: gateway response decode error for {method} {path}: {exc}", "warn")
+            return {}
 
     def provision_identity(self, node_pubkey: str, label: str) -> Optional[str]:
         """Generate a DID via the archon gatekeeper POST /api/v1/did/generate.
